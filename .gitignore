@@ -29,3 +29,6 @@ application.log
 .Trashes
 ehthumbs.db
 Thumbs.db
+out.txt
+test_captures_adv/
+test_captures_concurrent/

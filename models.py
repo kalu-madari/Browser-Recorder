@@ -24,7 +24,6 @@ class TransactionState:
     post_data: Optional[str] = None
     post_data_file: Optional[str] = None
     request_cookies: List[Dict[str, Any]] = field(default_factory=list)
-    context_cookies: List[Dict[str, Any]] = field(default_factory=list)
     initiator: Optional[Dict[str, Any]] = None
     
     # Response fields

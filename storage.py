@@ -35,6 +35,7 @@ class StorageManager:
             "html": 0, "js": 0, "css": 0, "json": 0, "images": 0, "fonts": 0, "media": 0, "other": 0,
             "bytes_saved": 0
         }
+        self.final_cookies = []
         
         self.session_start = datetime.now()
         self.init_files()
@@ -186,7 +187,8 @@ class StorageManager:
                 "end_time": datetime.now().isoformat(),
                 "browser": "Chromium",
                 "playwright": True,
-                "stats": self.stats
+                "stats": self.stats,
+                "context_cookies": self.final_cookies
             }
             with open(temp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)

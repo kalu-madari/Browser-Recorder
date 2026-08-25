@@ -62,6 +62,9 @@ class BrowserManager(threading.Thread):
             finally:
                 if self.browser:
                     try:
+                        if self.context:
+                            cookies = self.context.cookies()
+                            self.recorder.storage.final_cookies = cookies
                         self.browser.close()
                     except:
                         pass
@@ -76,6 +79,7 @@ class BrowserManager(threading.Thread):
         page.on("response", lambda r: self.recorder.handle_response(r))
         page.on("requestfinished", lambda r: self.recorder.handle_request_finished(r))
         page.on("requestfailed", lambda r: self.recorder.handle_request_failed(r))
+        page.on("close", lambda p: self._on_page_close(page_id))
         
         # CDP Integration for Initiator
         if config.enable_cdp:
@@ -83,18 +87,27 @@ class BrowserManager(threading.Thread):
                 cdp = self.context.new_cdp_session(page)
                 self.cdp_sessions[page_id] = cdp
                 cdp.send("Network.enable")
-                cdp.on("Network.requestWillBeSent", lambda event: self._on_cdp_request(event))
+                cdp.on("Network.requestWillBeSent", lambda event: self._on_cdp_request(event, page_id))
             except Exception as e:
                 logger.warning(f"Could not attach CDP session to {page_id}: {e}")
 
-    def _on_cdp_request(self, event):
+    def _on_page_close(self, page_id):
+        if page_id in self.cdp_sessions:
+            try:
+                # Playwright automatically detaches CDP on page close, 
+                # we just need to clean up our reference.
+                del self.cdp_sessions[page_id]
+            except Exception as e:
+                logger.error(f"Error cleaning up CDP session for {page_id}: {e}")
+
+    def _on_cdp_request(self, event, page_id):
         req = event.get("request", {})
         url = req.get("url")
         method = req.get("method")
         initiator = event.get("initiator")
         request_id = event.get("requestId")
         if url and initiator and request_id:
-            self.recorder.attach_cdp_request(url, method, request_id, initiator)
+            self.recorder.attach_cdp_request(url, method, request_id, initiator, event, page_id)
 
     def stop(self):
         self.running = False
