@@ -2,7 +2,10 @@ import queue
 import logging
 import threading
 from datetime import datetime
-from models import TransactionState, ResourceRecord, GUIEvent
+import time
+from collections import defaultdict
+from typing import Dict, Tuple
+from models import TransactionState, ResourceRecord, GUIEvent, WebSocketFrame, WebSocketState
 from resource_classifier import determine_extension
 from storage import StorageManager
 from config import config
@@ -23,12 +26,15 @@ class NetworkRecorder:
         # Bridging maps
         self.pw_to_cdp = {} # Playwright id(request) -> CDP requestId
         
-        import collections
         # FIFO queues used exclusively as a bridge, because Playwright Python 
         # does not expose the underlying CDP requestId on the Request object.
         # LIMITATION: This relies on the strict sequential emission order of Chromium events.
-        self.unmatched_playwright_requests = collections.defaultdict(list)
-        self.unmatched_cdp_requests = collections.defaultdict(list)
+        self.unmatched_playwright_requests: Dict[Tuple[str, str], list] = defaultdict(list)
+        self.unmatched_cdp_requests: Dict[Tuple[str, str], list] = defaultdict(list)
+        
+        self.active_websockets: Dict[str, WebSocketState] = {}
+        self.unmatched_cdp_websockets: Dict[str, list] = defaultdict(list)
+        self.unmatched_pw_websockets: Dict[str, list] = defaultdict(list)
         
     def get_next_seq(self):
         with self.lock:
@@ -40,23 +46,38 @@ class NetworkRecorder:
         
     def stop_recording(self):
         self.recording = False
+        logger.info(f"Stopping recording. Waiting for pending requests...")
         
-        # Wait for active transactions to settle naturally
-        import time
-        for _ in range(50):
+        # Graceful shutdown: wait for active requests to finish (max 5 seconds)
+        start_wait = time.time()
+        while time.time() - start_wait < 5.0:
             with self.lock:
                 if not self.active_transactions:
                     break
             time.sleep(0.1)
             
-        if self.storage:
-            with self.lock:
-                for req_id, txn in list(self.active_transactions.items()):
-                    txn.completed = True
-                    txn.error = "INCOMPLETE (Recording stopped)"
+        with self.lock:
+            # Finalize remaining HTTP transactions
+            for txn in list(self.active_transactions.values()):
+                txn.error = "INCOMPLETE (Recording stopped)"
+                txn.completed = True
+                txn.completion_time = datetime.now().isoformat()
+                if self.storage:
                     self.storage.finalize_transaction(txn)
-                self.active_transactions.clear()
+            self.active_transactions.clear()
+            
+            # Finalize open websockets
+            for ws_id, ws_state in list(self.active_websockets.items()):
+                if ws_state.status == "OPEN":
+                    ws_state.status = "OPEN_AT_CAPTURE_END"
+                    if self.storage:
+                        self.storage.write_websocket_state(ws_state)
+            self.active_websockets.clear()
+
+        if self.storage:
             self.storage.finalize()
+        
+        self.gui_queue.put({"type": "COMPLETED"})
 
     def attach_cdp_request(self, url: str, method: str, request_id: str, initiator: dict, event: dict, page_id: str):
         if not self.recording: return
@@ -97,6 +118,111 @@ class NetworkRecorder:
                 self.unmatched_cdp_requests[key].append(request_id)
                 
             self.gui_queue.put(GUIEvent(type="STARTED", transaction=txn))
+
+    def attach_cdp_websocket(self, url: str, request_id: str, page_id: str, event: dict):
+        if not self.recording: return
+        
+        with self.lock:
+            ts = datetime.now().isoformat()
+            
+            ws_state = WebSocketState(
+                id=request_id,
+                page_id=page_id,
+                url=url,
+                created_time=ts
+            )
+            self.active_websockets[request_id] = ws_state
+            
+            if self.storage:
+                self.storage.write_websocket_state(ws_state)
+            
+            self.unmatched_cdp_websockets[url].append(request_id)
+
+    def attach_cdp_websocket_handshake(self, request_id: str, is_request: bool, headers: dict, status: int = None, status_text: str = None):
+        with self.lock:
+            ws_state = self.active_websockets.get(request_id)
+            if not ws_state: return
+            
+            if is_request:
+                ws_state.handshake_request_headers = headers
+            else:
+                ws_state.handshake_response_headers = headers
+                if status is not None:
+                    ws_state.handshake_status = status
+                    ws_state.handshake_status_text = status_text
+                    
+            if self.storage:
+                self.storage.write_websocket_state(ws_state)
+
+    def attach_cdp_websocket_close(self, request_id: str, ts_close: str, reason: str = None, code: int = None):
+        with self.lock:
+            ws_state = self.active_websockets.get(request_id)
+            if not ws_state: return
+            
+            ws_state.closed_time = ts_close
+            if code: ws_state.close_code = code
+            if reason: ws_state.close_reason = reason
+            ws_state.status = "CLOSED"
+            
+            if self.storage:
+                self.storage.write_websocket_state(ws_state)
+            
+            del self.active_websockets[request_id]
+
+    def attach_cdp_websocket_frame(self, request_id: str, direction: str, response: dict):
+        with self.lock:
+            ws_state = self.active_websockets.get(request_id)
+            if not ws_state: return
+            
+            self.seq_counter += 1
+            seq = self.seq_counter
+            
+        ts = datetime.now().isoformat()
+        opcode = response.get("opcode", 1)
+        payload_data = response.get("payloadData", "")
+        
+        is_text = (opcode == 1)
+        payload_type = "text" if is_text else "binary"
+        
+        import base64
+        if is_text:
+            raw_bytes = payload_data.encode('utf-8')
+            payload_str = payload_data
+        else:
+            try:
+                raw_bytes = base64.b64decode(payload_data)
+            except:
+                raw_bytes = payload_data.encode('utf-8')
+            payload_str = None
+            
+        payload_size = len(raw_bytes)
+        
+        payload_file = None
+        if config.save_response_bodies:
+            if not is_text or payload_size >= 1000:
+                if self.storage:
+                    payload_file = self.storage.save_websocket_frame(request_id, seq, raw_bytes, is_text)
+                    if payload_file:
+                        payload_str = None
+                        
+        frame = WebSocketFrame(
+            sequence=seq,
+            websocket_id=request_id,
+            timestamp=ts,
+            direction=direction,
+            payload_type=payload_type,
+            payload_size=payload_size,
+            payload_file=payload_file,
+            payload=payload_str
+        )
+        
+        with self.lock:
+            ws_state = self.active_websockets.get(request_id)
+            if not ws_state: return
+            ws_state.frames.append(frame)
+            if self.storage:
+                self.storage.write_websocket_frame(ws_state, frame)
+                self.gui_queue.put({"type": "WS_UPDATED", "stats": len(self.active_websockets)})
 
     def handle_request(self, request, page_id: str):
         if not self.recording: return

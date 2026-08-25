@@ -22,6 +22,7 @@ class BrowserManager(threading.Thread):
         self.start_url = start_url
 
     def run(self):
+        print("DEBUG: BROWSER MANAGER RUN THREAD STARTED")
         self.gui_msg_queue.put({"type": "STATE", "state": "STARTING"})
         with sync_playwright() as p:
             self.playwright = p
@@ -40,7 +41,9 @@ class BrowserManager(threading.Thread):
                 time.sleep(1)
                 
                 if self.start_url:
+                    print("DEBUG: Navigating to", self.start_url)
                     page.goto(self.start_url)
+                    print("DEBUG: Navigated successfully")
                     # Trigger popup after short delay
                     page.evaluate("setTimeout(() => window.open('http://127.0.0.1:8080/popup.html'), 1000)")
                 else:
@@ -87,7 +90,14 @@ class BrowserManager(threading.Thread):
                 cdp = self.context.new_cdp_session(page)
                 self.cdp_sessions[page_id] = cdp
                 cdp.send("Network.enable")
+                import datetime
                 cdp.on("Network.requestWillBeSent", lambda event: self._on_cdp_request(event, page_id))
+                cdp.on("Network.webSocketCreated", lambda event: self.recorder.attach_cdp_websocket(event.get("url"), event.get("requestId"), page_id, event))
+                cdp.on("Network.webSocketWillSendHandshakeRequest", lambda event: self.recorder.attach_cdp_websocket_handshake(event.get("requestId"), True, event.get("request", {}).get("headers", {})))
+                cdp.on("Network.webSocketHandshakeResponseReceived", lambda event: self.recorder.attach_cdp_websocket_handshake(event.get("requestId"), False, event.get("response", {}).get("headers", {}), event.get("response", {}).get("status"), event.get("response", {}).get("statusText")))
+                cdp.on("Network.webSocketClosed", lambda event: self.recorder.attach_cdp_websocket_close(event.get("requestId"), datetime.datetime.now().isoformat(), event.get("reason"), event.get("code")))
+                cdp.on("Network.webSocketFrameSent", lambda event: self.recorder.attach_cdp_websocket_frame(event.get("requestId"), "SENT", event.get("response", {})))
+                cdp.on("Network.webSocketFrameReceived", lambda event: self.recorder.attach_cdp_websocket_frame(event.get("requestId"), "RECEIVED", event.get("response", {})))
             except Exception as e:
                 logger.warning(f"Could not attach CDP session to {page_id}: {e}")
 

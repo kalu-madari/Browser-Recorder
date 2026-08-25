@@ -15,14 +15,18 @@ class StorageManager:
         self.capture_dir = os.path.join(base_dir, self.session_id)
         self.resources_dir = os.path.join(self.capture_dir, "resources")
         self.request_bodies_dir = os.path.join(self.capture_dir, "request_bodies")
+        self.websocket_dir = os.path.join(self.capture_dir, "websocket")
         
         os.makedirs(self.capture_dir, exist_ok=True)
         os.makedirs(self.resources_dir, exist_ok=True)
         os.makedirs(self.request_bodies_dir, exist_ok=True)
+        os.makedirs(self.websocket_dir, exist_ok=True)
         
         self.network_log_path = os.path.join(self.capture_dir, "network_log.txt")
         self.manifest_path = os.path.join(self.capture_dir, "manifest.jsonl")
         self.session_path = os.path.join(self.capture_dir, "session.json")
+        self.websocket_log_path = os.path.join(self.capture_dir, "websocket_log.txt")
+        self.websocket_jsonl_path = os.path.join(self.capture_dir, "websocket.jsonl")
         
         self.lock = threading.Lock()
         
@@ -195,6 +199,90 @@ class StorageManager:
             os.replace(temp_path, self.session_path)
         except Exception as e:
             logger.error(f"Session info write error: {e}")
+
+    def save_websocket_frame(self, ws_id: str, sequence: int, payload: bytes, is_text: bool) -> str:
+        ws_dir = os.path.join(self.websocket_dir, ws_id)
+        os.makedirs(ws_dir, exist_ok=True)
+        ext = ".txt" if is_text else ".bin"
+        filename = f"{sequence:06d}{ext}"
+        filepath = os.path.join(ws_dir, filename)
+        try:
+            with open(filepath, "wb") as f:
+                f.write(payload)
+            return f"websocket/{ws_id}/{filename}"
+        except Exception as e:
+            logger.error(f"Failed to save WS frame {filename}: {e}")
+            return None
+
+    def write_websocket_state(self, ws_state):
+        with self.lock:
+            self._write_websocket_to_manifest(ws_state)
+            self._write_websocket_to_log(ws_state)
+
+    def write_websocket_frame(self, ws_state, frame):
+        with self.lock:
+            # Append frame to the jsonl and log incrementally
+            self._write_websocket_to_manifest(ws_state, frame=frame)
+            self._write_websocket_frame_to_log(ws_state, frame)
+
+    def _write_websocket_to_manifest(self, ws_state, frame=None):
+        try:
+            with open(self.websocket_jsonl_path, "a", encoding="utf-8") as f:
+                if frame is None:
+                    # Connection info
+                    d = ws_state.to_dict()
+                    d["type"] = "connection"
+                    d.pop("frames", None)
+                    f.write(json.dumps(d) + "\n")
+                else:
+                    # Frame info
+                    d = frame.to_dict()
+                    d["type"] = "frame"
+                    f.write(json.dumps(d) + "\n")
+        except Exception as e:
+            logger.error(f"WS Manifest write error: {e}")
+
+    def _write_websocket_to_log(self, ws_state):
+        try:
+            with open(self.websocket_log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n{'='*60}\n")
+                f.write(f"WEBSOCKET\n")
+                f.write(f"{'='*60}\n")
+                f.write(f"ID: {ws_state.id}\n")
+                f.write(f"PAGE: {ws_state.page_id}\n")
+                f.write(f"URL: {ws_state.url}\n")
+                f.write(f"CREATED: {ws_state.created_time}\n")
+                f.write(f"{'-'*60}\nHANDSHAKE\n")
+                if ws_state.handshake_status:
+                    f.write(f"STATUS: {ws_state.handshake_status} {ws_state.handshake_status_text}\n")
+                
+                if ws_state.status != "OPEN":
+                    f.write(f"{'-'*60}\nCLOSED\n")
+                    f.write(f"TIME: {ws_state.closed_time}\n")
+                    if ws_state.close_code:
+                        f.write(f"CODE: {ws_state.close_code}\n")
+                        f.write(f"REASON: {ws_state.close_reason}\n")
+                    if ws_state.status != "CLOSED":
+                        f.write(f"STATUS: {ws_state.status}\n")
+        except Exception as e:
+            logger.error(f"WS Log write error: {e}")
+
+    def _write_websocket_frame_to_log(self, ws_state, frame):
+        try:
+            with open(self.websocket_log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n{'-'*60}\n")
+                f.write(f"FRAME {frame.sequence:06d} (WS: {frame.websocket_id})\n")
+                f.write(f"TIME: {frame.timestamp}\n")
+                f.write(f"DIRECTION: {frame.direction}\n")
+                f.write(f"TYPE: {frame.payload_type.upper()}\n")
+                f.write(f"SIZE: {frame.payload_size}\n")
+                f.write("PAYLOAD:\n")
+                if frame.payload:
+                    f.write(frame.payload[:1000] + ("...\n" if len(frame.payload)>1000 else "\n"))
+                elif frame.payload_file:
+                    f.write(f"Saved to: {frame.payload_file}\n")
+        except Exception as e:
+            logger.error(f"WS Frame Log write error: {e}")
 
     def finalize(self):
         with self.lock:
