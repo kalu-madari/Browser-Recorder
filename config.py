@@ -20,5 +20,8 @@ class AppConfig:
     enable_screenshots: bool = False
     enable_interactions: bool = True
     record_text_input_values: bool = False
+    enable_stealth_mode: bool = True
+    extension_path: str = r"C:\Users\navee\browser_recorder\extensions\cookie-editor"
+    user_data_dir: str = r"C:\Users\navee\browser_recorder\user_data"
 
 config = AppConfig()

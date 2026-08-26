@@ -5,6 +5,11 @@ from playwright.sync_api import sync_playwright
 from network_recorder import NetworkRecorder
 from config import config
 
+try:
+    from playwright_stealth import Stealth
+except ImportError:
+    Stealth = None
+
 logger = logging.getLogger(__name__)
 
 class BrowserManager(threading.Thread):
@@ -35,8 +40,39 @@ class BrowserManager(threading.Thread):
             self.playwright = p
             try:
                 # ignore_https_errors should be False by default per requirements
-                self.browser = p.chromium.launch(headless=False, args=['--disable-popup-blocking'])
-                self.context = self.browser.new_context(ignore_https_errors=False)
+                args = ['--disable-popup-blocking']
+                ignore_default_args = None
+                
+                if getattr(config, 'enable_stealth_mode', False):
+                    args.extend([
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-infobars',
+                    ])
+                    ignore_default_args = ['--enable-automation']
+
+                if config.extension_path:
+                    args.extend([
+                        f'--disable-extensions-except={config.extension_path}',
+                        f'--load-extension={config.extension_path}'
+                    ])
+                    self.browser = None
+                    self.context = p.chromium.launch_persistent_context(
+                        config.user_data_dir or "./user_data",
+                        headless=False,
+                        args=args,
+                        ignore_default_args=ignore_default_args,
+                        ignore_https_errors=False
+                    )
+                else:
+                    self.browser = p.chromium.launch(
+                        headless=False,
+                        args=args,
+                        ignore_default_args=ignore_default_args
+                    )
+                    self.context = self.browser.new_context(ignore_https_errors=False)
+
+                if getattr(config, 'enable_stealth_mode', False) and Stealth:
+                    Stealth().apply_stealth_sync(self.context)
                 
                 if config.enable_interactions:
                     self.context.expose_binding("record_interaction", self._on_interaction)
@@ -217,22 +253,23 @@ class BrowserManager(threading.Thread):
                 logger.error(f"Browser thread error: {e}")
                 self.gui_msg_queue.put({"type": "STATE", "state": "ERROR"})
             finally:
-                if self.browser:
-                    try:
-                        if self.context:
-                            if config.enable_dom_snapshots:
-                                for page in self.context.pages:
-                                    page_id = getattr(page, '_page_id', 'unknown')
-                                    try:
-                                        self.capture_all_frames(page, page_id, "shutdown")
-                                    except Exception:
-                                        pass
-                            
-                            cookies = self.context.cookies()
-                            self.recorder.storage.final_cookies = cookies
+                try:
+                    if self.context:
+                        if config.enable_dom_snapshots:
+                            for page in self.context.pages:
+                                page_id = getattr(page, '_page_id', 'unknown')
+                                try:
+                                    self.capture_all_frames(page, page_id, "shutdown")
+                                except Exception:
+                                    pass
+                        
+                        cookies = self.context.cookies()
+                        self.recorder.storage.final_cookies = cookies
+                        self.context.close()
+                    if self.browser:
                         self.browser.close()
-                    except:
-                        pass
+                except:
+                    pass
                 self.gui_msg_queue.put({"type": "STATE", "state": "CLOSED"})
                 
     def on_page(self, page):
