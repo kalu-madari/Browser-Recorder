@@ -117,3 +117,24 @@ class NavigationRecord:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+@dataclass
+class InteractionRecord:
+    interaction_id: str
+    page_id: str
+    frame_id: str
+    timestamp: str
+    event_type: str
+    target_tag: str
+    target_selector: str
+    target_text: Optional[str]
+    target_value: Optional[str]
+    value_recorded: bool
+    coordinates: Optional[Dict[str, int]]
+    key: Optional[str]
+    dom_snapshot_id: Optional[str]
+    navigation_id: Optional[str]
+    is_trusted: bool
+
+    def to_dict(self) -> dict:
+        return asdict(self)

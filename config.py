@@ -18,5 +18,7 @@ class AppConfig:
     enable_har: bool = True
     enable_dom_snapshots: bool = True
     enable_screenshots: bool = False
+    enable_interactions: bool = True
+    record_text_input_values: bool = False
 
 config = AppConfig()

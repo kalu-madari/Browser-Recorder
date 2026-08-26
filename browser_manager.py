@@ -24,6 +24,9 @@ class BrowserManager(threading.Thread):
         self.nav_counter = 0
         self.frame_urls = {} # frame_id -> url
         self.recent_navs = {} # nav_id -> NavigationRecord
+        self.latest_nav_id = {}
+        self.latest_dom_id = {}
+        self.interaction_counter = 0
         
     def run(self):
         print("DEBUG: BROWSER MANAGER RUN THREAD STARTED")
@@ -34,6 +37,93 @@ class BrowserManager(threading.Thread):
                 # ignore_https_errors should be False by default per requirements
                 self.browser = p.chromium.launch(headless=False, args=['--disable-popup-blocking'])
                 self.context = self.browser.new_context(ignore_https_errors=False)
+                
+                if config.enable_interactions:
+                    self.context.expose_binding("record_interaction", self._on_interaction)
+                    self.context.add_init_script("""
+(() => {
+    const eventsToCapture = ['click', 'dblclick', 'mousedown', 'mouseup', 'keydown', 'keyup', 'input', 'submit', 'scroll', 'focus', 'blur', 'copy', 'cut', 'paste'];
+
+    function getCssSelector(el) {
+        if (!(el instanceof Element)) return '';
+        let path = [];
+        while (el && el.nodeType === Node.ELEMENT_NODE) {
+            let selector = el.nodeName.toLowerCase();
+            if (el.id) {
+                selector += '#' + el.id;
+                path.unshift(selector);
+                break;
+            } else {
+                let sib = el, nth = 1;
+                while (sib = sib.previousElementSibling) {
+                    if (sib.nodeName.toLowerCase() == selector) nth++;
+                }
+                if (nth != 1) selector += ":nth-of-type("+nth+")";
+            }
+            path.unshift(selector);
+            el = el.parentNode;
+        }
+        return path.join(" > ");
+    }
+
+    function isSensitive(el) {
+        if (!el) return false;
+        const sensitiveTypes = ['password', 'hidden'];
+        if (el.tagName === 'INPUT' && sensitiveTypes.includes(el.type.toLowerCase())) return true;
+        const name = (el.name || '').toLowerCase();
+        const id = (el.id || '').toLowerCase();
+        const sensitiveWords = ['password', 'token', 'cvv', 'secret', 'creditcard', 'cc_number', 'card'];
+        return sensitiveWords.some(w => name.includes(w) || id.includes(w));
+    }
+
+    function interactionHandler(event) {
+        const target = event.target;
+        let targetTag = target ? (target.tagName ? target.tagName.toLowerCase() : 'unknown') : 'unknown';
+        let targetSelector = target ? getCssSelector(target) : '';
+        let targetText = target ? (target.innerText ? target.innerText.substring(0, 100) : '') : '';
+        
+        let targetValue = null;
+        let isSens = isSensitive(target);
+        
+        if (targetTag === 'input' || targetTag === 'textarea' || targetTag === 'select') {
+            if (!isSens) {
+                targetValue = target.value;
+            } else {
+                targetValue = "[SENSITIVE]";
+            }
+        }
+        
+        let coordinates = null;
+        if (['click', 'dblclick', 'mousedown', 'mouseup'].includes(event.type)) {
+            coordinates = {x: event.clientX, y: event.clientY};
+        }
+        
+        let key = null;
+        if (['keydown', 'keyup'].includes(event.type)) {
+            key = event.key;
+        }
+        
+        const payload = {
+            event_type: event.type,
+            target_tag: targetTag,
+            target_selector: targetSelector,
+            target_text: targetText,
+            target_value: targetValue,
+            coordinates: coordinates,
+            key: key,
+            is_trusted: event.isTrusted
+        };
+        
+        if (window.record_interaction) {
+            window.record_interaction(payload).catch(() => {});
+        }
+    }
+
+    eventsToCapture.forEach(ev => {
+        document.addEventListener(ev, interactionHandler, {capture: true, passive: true});
+    });
+})();
+                    """)
                 
                 self.context.on("page", self.on_page)
                 
@@ -112,6 +202,8 @@ class BrowserManager(threading.Thread):
                             if len(self.context.pages) > 1:
                                 try: self.context.pages[-1].close()
                                 except Exception as e: logger.error(f"close_page error: {e}")
+                        elif cmd.get("action") == "record_interaction":
+                            self._handle_interaction(cmd.get("source"), cmd.get("payload"))
                     except queue.Empty:
                         pass
                         
@@ -225,6 +317,7 @@ class BrowserManager(threading.Thread):
         )
         self.recent_navs[nav_id] = record
         self.recorder.storage.save_navigation_record(record)
+        self.latest_nav_id[frame_id] = nav_id
         
         # Request DOM snapshot for this navigation
         self.command_queue.put({"action": "capture_dom", "reason": "Navigation", "nav_id": nav_id, "nav_frame_id": frame_id, "dom_snapshot_id": dom_snapshot_id, "page_id": page_id})
@@ -286,6 +379,7 @@ class BrowserManager(threading.Thread):
                     html_size=0
                 )
                 self.recorder.storage.save_dom_snapshot(record, html_bytes)
+                self.latest_dom_id[f_id] = record.snapshot_id
         except Exception as e:
             logger.error(f"DOM capture failed for {page_id}: {e}")
 
@@ -312,3 +406,57 @@ class BrowserManager(threading.Thread):
 
     def stop(self):
         self.running = False
+
+    def _on_interaction(self, source, payload):
+        self.command_queue.put({
+            "action": "record_interaction",
+            "source": source,
+            "payload": payload
+        })
+
+    def _handle_interaction(self, source, payload):
+        page = source.get("page")
+        frame = source.get("frame")
+        if not page or not frame:
+            return
+            
+        page_id = getattr(page, '_page_id', 'unknown')
+        f_id = "main" if frame == page.main_frame else (frame.name or f"frame-{id(frame)}")
+        
+        self.interaction_counter += 1
+        interaction_id = f"int-{self.interaction_counter:06d}"
+        
+        import datetime
+        from models import InteractionRecord
+        
+        target_value = payload.get("target_value")
+        value_recorded = False
+        
+        if target_value == "[SENSITIVE]":
+            target_value = None
+            value_recorded = False
+        elif target_value is not None:
+            if config.record_text_input_values:
+                value_recorded = True
+            else:
+                target_value = None
+                value_recorded = False
+                
+        record = InteractionRecord(
+            interaction_id=interaction_id,
+            page_id=page_id,
+            frame_id=f_id,
+            timestamp=datetime.datetime.now().isoformat(),
+            event_type=payload.get("event_type"),
+            target_tag=payload.get("target_tag"),
+            target_selector=payload.get("target_selector"),
+            target_text=payload.get("target_text"),
+            target_value=target_value,
+            value_recorded=value_recorded,
+            coordinates=payload.get("coordinates"),
+            key=payload.get("key"),
+            dom_snapshot_id=self.latest_dom_id.get(f_id),
+            navigation_id=self.latest_nav_id.get(f_id),
+            is_trusted=payload.get("is_trusted", False)
+        )
+        self.recorder.storage.save_interaction_record(record)

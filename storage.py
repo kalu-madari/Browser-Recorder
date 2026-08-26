@@ -3,7 +3,7 @@ import json
 import hashlib
 import threading
 from datetime import datetime
-from models import TransactionState, DOMSnapshotRecord
+from models import TransactionState, DOMSnapshotRecord, InteractionRecord
 import logging
 from config import config
 
@@ -35,6 +35,9 @@ class StorageManager:
         
         self.navigation_manifest_path = os.path.join(self.capture_dir, "navigation.jsonl")
         self.navigation_log_path = os.path.join(self.capture_dir, "navigation_log.txt")
+        
+        self.interaction_manifest_path = os.path.join(self.capture_dir, "interaction.jsonl")
+        self.interaction_log_path = os.path.join(self.capture_dir, "interaction_log.txt")
         
         self.lock = threading.RLock()
         
@@ -71,6 +74,12 @@ class StorageManager:
             
         with open(self.navigation_log_path, "w", encoding="utf-8") as f:
             f.write(f"NAVIGATION HISTORY: {self.session_id}\n")
+            
+        with open(self.interaction_manifest_path, "w", encoding="utf-8") as f:
+            pass
+            
+        with open(self.interaction_log_path, "w", encoding="utf-8") as f:
+            f.write(f"INTERACTION LOG: {self.session_id}\n")
             
         self.write_session_info()
         
@@ -182,6 +191,39 @@ class StorageManager:
                     f.write(f"{'-'*60}\n")
             except Exception as e:
                 logger.error(f"Navigation Manifest write error: {e}")
+                return False
+        return True
+
+    def save_interaction_record(self, record):
+        with self.lock:
+            try:
+                with open(self.interaction_manifest_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record.to_dict()) + "\n")
+                    
+                with open(self.interaction_log_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n{'='*60}\n")
+                    f.write(f"INTERACTION {record.interaction_id}\n")
+                    f.write(f"{'='*60}\n\n")
+                    f.write(f"PAGE: {record.page_id}\n")
+                    f.write(f"FRAME: {record.frame_id}\n")
+                    f.write(f"TIME: {record.timestamp}\n")
+                    f.write(f"TYPE: {record.event_type}\n")
+                    f.write(f"TARGET TAG: {record.target_tag}\n")
+                    f.write(f"TARGET SELECTOR: {record.target_selector}\n")
+                    if record.target_text:
+                        f.write(f"TARGET TEXT: {record.target_text}\n")
+                    if record.value_recorded and record.target_value is not None:
+                        f.write(f"TARGET VALUE: {record.target_value}\n")
+                    if record.coordinates:
+                        f.write(f"COORDINATES: x={record.coordinates['x']}, y={record.coordinates['y']}\n")
+                    if record.key:
+                        f.write(f"KEY: {record.key}\n")
+                    f.write(f"DOM SNAPSHOT: {record.dom_snapshot_id or 'none'}\n")
+                    f.write(f"NAVIGATION: {record.navigation_id or 'none'}\n")
+                    f.write(f"IS TRUSTED: {str(record.is_trusted).lower()}\n")
+                    f.write(f"{'-'*60}\n")
+            except Exception as e:
+                logger.error(f"Interaction Manifest write error: {e}")
                 return False
         return True
 
