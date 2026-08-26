@@ -3,7 +3,7 @@ import json
 import hashlib
 import threading
 from datetime import datetime
-from models import TransactionState
+from models import TransactionState, DOMSnapshotRecord
 import logging
 from config import config
 
@@ -22,17 +22,28 @@ class StorageManager:
         os.makedirs(self.request_bodies_dir, exist_ok=True)
         os.makedirs(self.websocket_dir, exist_ok=True)
         
+        self.dom_dir = os.path.join(self.capture_dir, "dom")
+        os.makedirs(self.dom_dir, exist_ok=True)
+
+        
         self.network_log_path = os.path.join(self.capture_dir, "network_log.txt")
         self.manifest_path = os.path.join(self.capture_dir, "manifest.jsonl")
         self.session_path = os.path.join(self.capture_dir, "session.json")
         self.websocket_log_path = os.path.join(self.capture_dir, "websocket_log.txt")
         self.websocket_jsonl_path = os.path.join(self.capture_dir, "websocket.jsonl")
+        self.dom_manifest_path = os.path.join(self.capture_dir, "dom.jsonl")
         
-        self.lock = threading.Lock()
+        self.navigation_manifest_path = os.path.join(self.capture_dir, "navigation.jsonl")
+        self.navigation_log_path = os.path.join(self.capture_dir, "navigation_log.txt")
+        
+        self.lock = threading.RLock()
         
         # Buffer for completed transactions to ensure chronological logging based on sequence
         self.completed_txns = {}
         self.next_seq_to_write = 1
+        
+        self.dom_sequence = {} # (page_id, frame_id) -> int
+
         
         self.stats = {
             "requests": 0, "responses": 0, "failed": 0,
@@ -51,6 +62,15 @@ class StorageManager:
         # Initialize an empty manifest jsonl file
         with open(self.manifest_path, "w", encoding="utf-8") as f:
             pass
+            
+        with open(self.dom_manifest_path, "w", encoding="utf-8") as f:
+            pass
+            
+        with open(self.navigation_manifest_path, "w", encoding="utf-8") as f:
+            pass
+            
+        with open(self.navigation_log_path, "w", encoding="utf-8") as f:
+            f.write(f"NAVIGATION HISTORY: {self.session_id}\n")
             
         self.write_session_info()
         
@@ -81,6 +101,89 @@ class StorageManager:
         except Exception as e:
             logger.error(f"Failed to save request body {filename}: {e}")
             return None
+
+    def get_next_dom_snapshot_id(self, page_id, frame_id):
+        with self.lock:
+            key = (page_id, frame_id)
+            if key not in self.dom_sequence:
+                self.dom_sequence[key] = 1
+            seq = self.dom_sequence[key]
+            self.dom_sequence[key] += 1
+            return f"{seq:06d}"
+
+    def save_dom_snapshot(self, record: 'DOMSnapshotRecord', html_bytes: bytes) -> bool:
+        with self.lock:
+            if not record.snapshot_id:
+                record.snapshot_id = self.get_next_dom_snapshot_id(record.page_id, record.frame_id)
+            seq = int(record.snapshot_id)
+
+            if len(html_bytes) > config.max_dom_snapshot_size:
+                logger.warning(f"DOM snapshot exceeded max size: {len(html_bytes)} bytes")
+                record.truncated = True
+                html_bytes = b""
+            
+            if not record.truncated:
+                page_dir = os.path.join(self.dom_dir, record.page_id)
+                if record.frame_id:
+                    page_dir = os.path.join(page_dir, record.frame_id)
+                os.makedirs(page_dir, exist_ok=True)
+                    
+                filename = f"{seq:06d}.html"
+                filepath = os.path.join(page_dir, filename)
+                
+                try:
+                    with open(filepath, "wb") as f:
+                        f.write(html_bytes)
+                    record.html_path = os.path.relpath(filepath, self.capture_dir).replace('\\', '/')
+                    record.html_sha256 = hashlib.sha256(html_bytes).hexdigest()
+                    record.html_size = len(html_bytes)
+                except Exception as e:
+                    logger.error(f"Failed to save DOM snapshot {filename}: {e}")
+                    return False
+            else:
+                record.html_path = ""
+                record.html_sha256 = ""
+                record.html_size = 0
+            
+            try:
+                with open(self.dom_manifest_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record.to_dict()) + "\n")
+            except Exception as e:
+                logger.error(f"DOM Manifest write error: {e}")
+                return False
+                
+        return True
+
+    def save_navigation_record(self, record):
+        with self.lock:
+            try:
+                with open(self.navigation_manifest_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record.to_dict()) + "\n")
+                    
+                with open(self.navigation_log_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n{'='*60}\n")
+                    f.write(f"NAVIGATION {record.navigation_id}\n")
+                    f.write(f"{'='*60}\n\n")
+                    f.write(f"PAGE: {record.page_id}\n")
+                    f.write(f"FRAME: {record.frame_id}\n")
+                    f.write(f"TIME: {record.timestamp}\n\n")
+                    f.write(f"FROM:\n{record.from_url if record.from_url else '-'}\n\n")
+                    f.write(f"TO:\n{record.to_url}\n\n")
+                    f.write(f"TYPE:\n{record.type}\n\n")
+                    f.write(f"REASON:\n{record.reason}\n\n")
+                    f.write(f"STATUS:\n{record.status if record.status is not None else '-'}\n\n")
+                    f.write(f"SUCCESS:\n{str(record.success).lower()}\n\n")
+                    if record.error:
+                        f.write(f"ERROR:\n{record.error}\n\n")
+                    if record.document_request_sequence is not None:
+                        f.write(f"DOCUMENT REQUEST:\n{record.document_request_sequence:06d}\n\n")
+                    if record.dom_snapshot_id:
+                        f.write(f"DOM SNAPSHOT:\n{record.dom_snapshot_id}\n\n")
+                    f.write(f"{'-'*60}\n")
+            except Exception as e:
+                logger.error(f"Navigation Manifest write error: {e}")
+                return False
+        return True
 
     def _update_stats(self, txn: TransactionState):
         self.stats["requests"] += 1

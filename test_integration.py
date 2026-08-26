@@ -131,6 +131,10 @@ def run_server():
     return server
 
 def test_integration():
+    import faulthandler
+    faulthandler.enable()
+    faulthandler.dump_traceback_later(30, repeat=True) # Dump tracebacks if it hangs
+    
     print("Starting test server...")
     server = run_server()
     time.sleep(1)
@@ -180,10 +184,14 @@ def test_integration():
     
     print("Stopping recording...")
     recorder.stop_recording()
+    print("Recorder stopped.")
     
     # Shutdown
+    print("Stopping BM...")
     bm.stop()
+    print("Joining BM...")
     bm.join(timeout=5)
+    print("BM joined.")
     
     # Check outputs
     print("Checking outputs...")
@@ -198,7 +206,10 @@ def test_integration():
     urls = [t['url'] for t in txns]
     print(f"Captured {len(txns)} transactions.")
     
-    assert any('/app.js' in u for u in urls), "Missing app.js"
+    if not any('/app.js' in u for u in urls):
+        print("Captured URLs:", urls)
+        assert False, "Missing app.js"
+
     assert any('/delayed' in u for u in urls), "Missing delayed"
     assert any('/duplicate' in u for u in urls), "Missing duplicate"
     assert urls.count('http://127.0.0.1:8080/duplicate') >= 2, "Duplicates not separate"

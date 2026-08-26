@@ -17,7 +17,7 @@ class HTMLHandler(BaseHTTPRequestHandler):
             self.end_headers()
             html = """
             <html><body><script>
-            let ws1 = new WebSocket('ws://127.0.0.1:8765/ws/a');
+            let ws1 = new WebSocket('ws://127.0.0.1:8768/ws/a');
             ws1.binaryType = 'arraybuffer';
             ws1.onopen = () => {
                 console.log("WS1 OPENED");
@@ -26,7 +26,7 @@ class HTMLHandler(BaseHTTPRequestHandler):
             };
             ws1.onmessage = (e) => console.log("WS1 MSG:", e.data);
             
-            let ws2 = new WebSocket('ws://127.0.0.1:8765/ws/b');
+            let ws2 = new WebSocket('ws://127.0.0.1:8768/ws/b');
             ws2.binaryType = 'arraybuffer';
             ws2.onopen = () => {
                 console.log("WS2 OPENED");
@@ -34,7 +34,7 @@ class HTMLHandler(BaseHTTPRequestHandler):
             };
             
             // Third connection stays open
-            window.ws3 = new WebSocket('ws://127.0.0.1:8765/ws/c');
+            window.ws3 = new WebSocket('ws://127.0.0.1:8768');
             </script></body></html>
             """
             self.wfile.write(html.encode())
@@ -43,12 +43,12 @@ class HTMLHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
 def run_http():
-    server = ThreadingHTTPServer(('127.0.0.1', 8092), HTMLHandler)
+    server = ThreadingHTTPServer(('127.0.0.1', 8093), HTMLHandler)
     server.serve_forever()
 
 def run_ws():
     async def serve():
-        async with websockets.serve(echo, "127.0.0.1", 8765):
+        async with websockets.serve(echo, "127.0.0.1", 8768):
             await asyncio.Future()
     asyncio.run(serve())
 
@@ -90,7 +90,7 @@ def main():
         cdp.on("Network.webSocketFrameSent", lambda e: recorder.attach_cdp_websocket_frame(e.get("requestId"), "SENT", e.get("response", {})))
         cdp.on("Network.webSocketFrameReceived", lambda e: recorder.attach_cdp_websocket_frame(e.get("requestId"), "RECEIVED", e.get("response", {})))
         
-        page.goto("http://127.0.0.1:8092/")
+        page.goto("http://127.0.0.1:8093/")
         page.wait_for_timeout(3000)
         
         recorder.stop_recording()

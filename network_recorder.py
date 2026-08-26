@@ -17,11 +17,12 @@ class NetworkRecorder:
         self.storage = storage
         self.gui_queue = gui_queue
         self.seq_counter = 0
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.recording = False
         
         # Authoritative mapping: CDP requestId -> TransactionState
         self.active_transactions = {}
+        self.loader_to_seq = {}
         
         # Bridging maps
         self.pw_to_cdp = {} # Playwright id(request) -> CDP requestId
@@ -106,6 +107,10 @@ class NetworkRecorder:
             
             self.active_transactions[request_id] = txn
             
+            loader_id = event.get("loaderId")
+            if loader_id and event.get("type") == "Document":
+                self.loader_to_seq[loader_id] = seq
+            
             # 2. Bridge to Playwright
             if self.unmatched_playwright_requests[key]:
                 # A Playwright request already arrived and is waiting for CDP
@@ -114,10 +119,11 @@ class NetworkRecorder:
                 self.pw_to_cdp[pw_id] = request_id
                 self._enrich_transaction_from_playwright(txn, pw_req)
             else:
-                # Store CDP request ID waiting for Playwright request
                 self.unmatched_cdp_requests[key].append(request_id)
                 
             self.gui_queue.put(GUIEvent(type="STARTED", transaction=txn))
+
+
 
     def attach_cdp_websocket(self, url: str, request_id: str, page_id: str, event: dict):
         if not self.recording: return
@@ -231,15 +237,15 @@ class NetworkRecorder:
         
         with self.lock:
             if self.unmatched_cdp_requests[key]:
-                # A CDP request already arrived
                 cdp_id = self.unmatched_cdp_requests[key].pop(0)
                 self.pw_to_cdp[pw_id] = cdp_id
                 txn = self.active_transactions.get(cdp_id)
                 if txn:
                     self._enrich_transaction_from_playwright(txn, request)
             else:
-                # Playwright request arrived before CDP
                 self.unmatched_playwright_requests[key].append(request)
+
+
 
     def _enrich_transaction_from_playwright(self, txn: TransactionState, request):
         # Override with rich Playwright data if available
@@ -310,17 +316,59 @@ class NetworkRecorder:
         
         with self.lock:
             cdp_id = self.pw_to_cdp.pop(pw_id, None)
-            if not cdp_id: return
-            txn = self.active_transactions.pop(cdp_id, None)
+            txn = self.active_transactions.pop(cdp_id, None) if cdp_id else None
             
-        if txn:
-            txn.completed = True
-            txn.completion_time = ts
-            if not txn.error and not txn.resource and config.save_response_bodies and txn.status not in (204, 301, 302, 303, 304, 307, 308):
-                # Request finished successfully but body capture failed/unavailable
-                txn.error = "Body unavailable"
-            self.storage.finalize_transaction(txn)
-            self.gui_queue.put(GUIEvent(type="COMPLETED", transaction=txn))
+            if not txn:
+                # Fallback for requests missed by CDP
+                key = (request.url, request.method)
+                if request in self.unmatched_playwright_requests[key]:
+                    self.unmatched_playwright_requests[key].remove(request)
+                
+                self.seq_counter += 1
+                seq = self.seq_counter
+                txn = TransactionState(
+                    id=f"pw-{pw_id}",
+                    sequence=seq,
+                    url=request.url,
+                    method=request.method,
+                    request_headers=request.headers,
+                    request_time=ts,
+                    resource_type=request.resource_type,
+                    page_id="",
+                    frame_url=request.frame.url if request.frame else ""
+                )
+
+                self._enrich_transaction_from_playwright(txn, request)
+                txn.response_time = ts
+                
+                # simulate response
+                try:
+                    resp = request.response()
+                    if resp:
+                        txn.status = resp.status
+                        txn.status_text = resp.status_text
+                        txn.response_headers = resp.headers
+                        txn.content_type = resp.headers.get("content-type", "")
+                        if config.save_response_bodies:
+                            body = resp.body()
+                            if body:
+                                ext = determine_extension(txn.url, txn.content_type, txn.resource_type)
+                                res_info = self.storage.save_resource(txn.sequence, body, ext)
+                                if res_info:
+                                    txn.resource = ResourceRecord(
+                                        file_path=res_info["file_path"], size=res_info["size"],
+                                        sha256=res_info["sha256"], mime_type=txn.content_type, extension=ext
+                                    )
+                except:
+                    pass
+
+        txn.completed = True
+        txn.completion_time = ts
+        if not txn.error and not txn.resource and config.save_response_bodies and txn.status not in (204, 301, 302, 303, 304, 307, 308):
+            txn.error = "Body unavailable"
+        self.storage.finalize_transaction(txn)
+        self.gui_queue.put(GUIEvent(type="COMPLETED", transaction=txn))
+
             
     def handle_request_failed(self, request):
         if not self.recording: return
@@ -329,12 +377,49 @@ class NetworkRecorder:
         
         with self.lock:
             cdp_id = self.pw_to_cdp.pop(pw_id, None)
-            if not cdp_id: return
-            txn = self.active_transactions.pop(cdp_id, None)
+            txn = self.active_transactions.pop(cdp_id, None) if cdp_id else None
             
-        if txn:
-            txn.completed = True
-            txn.completion_time = ts
-            txn.error = request.failure
-            self.storage.finalize_transaction(txn)
-            self.gui_queue.put(GUIEvent(type="FAILED", transaction=txn))
+            if not txn:
+                key = (request.url, request.method)
+                if request in self.unmatched_playwright_requests[key]:
+                    self.unmatched_playwright_requests[key].remove(request)
+                self.seq_counter += 1
+                txn = TransactionState(
+                    id=f"pw-{pw_id}", sequence=self.seq_counter,
+                    url=request.url, method=request.method,
+                    request_headers=request.headers, request_time=ts,
+                    resource_type=request.resource_type, page_id="",
+                    frame_url=request.frame.url if request.frame else ""
+                )
+
+                self._enrich_transaction_from_playwright(txn, request)
+                
+        txn.completed = True
+        txn.completion_time = ts
+        txn.error = request.failure
+        self.storage.finalize_transaction(txn)
+        self.gui_queue.put(GUIEvent(type="FAILED", transaction=txn))
+        
+        if request.is_navigation_request():
+            # Create a failed navigation record
+            from models import NavigationRecord
+            frame_id = "main" if request.frame == request.frame.page.main_frame else (request.frame.name or f"frame-{id(request.frame)}")
+            nav_id = f"nav_fail_{self.seq_counter:06d}"
+            
+            nav_record = NavigationRecord(
+                navigation_id=nav_id,
+                page_id=txn.page_id,
+                frame_id=frame_id,
+                timestamp=ts,
+                from_url=None, # Cannot easily get from here, but this is a failure
+                to_url=request.url,
+                type="document_navigation",
+                reason="Navigation",
+                status=None,
+                success=False,
+                document_request_sequence=txn.sequence,
+                dom_snapshot_id=None,
+                error=request.failure
+            )
+            self.storage.save_navigation_record(nav_record)
+

@@ -81,3 +81,39 @@ class TransactionState:
 class GUIEvent:
     type: str # "STARTED", "UPDATED", "COMPLETED", "FAILED"
     transaction: TransactionState
+
+@dataclass
+class DOMSnapshotRecord:
+    snapshot_id: str
+    page_id: str
+    frame_id: str
+    url: str
+    timestamp: str
+    reason: str
+    title: str
+    html_path: str
+    html_sha256: str
+    html_size: int
+    truncated: bool = False
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+@dataclass
+class NavigationRecord:
+    navigation_id: str
+    page_id: str
+    frame_id: str
+    timestamp: str
+    from_url: Optional[str]
+    to_url: str
+    type: str
+    reason: str
+    status: Optional[int]
+    success: bool
+    document_request_sequence: Optional[int]
+    dom_snapshot_id: Optional[str]
+    error: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
