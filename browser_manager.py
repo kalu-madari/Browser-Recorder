@@ -290,6 +290,7 @@ class BrowserManager(threading.Thread):
                 cdp.send("Page.enable")
                 import datetime
                 cdp.on("Network.requestWillBeSent", lambda event: self._on_cdp_request(event, page_id))
+                cdp.on("Network.responseReceived", lambda event: self.recorder.attach_cdp_response(event))
                 cdp.on("Network.webSocketCreated", lambda event: self.recorder.attach_cdp_websocket(event.get("url"), event.get("requestId"), page_id, event))
                 cdp.on("Network.webSocketWillSendHandshakeRequest", lambda event: self.recorder.attach_cdp_websocket_handshake(event.get("requestId"), True, event.get("request", {}).get("headers", {})))
                 cdp.on("Network.webSocketHandshakeResponseReceived", lambda event: self.recorder.attach_cdp_websocket_handshake(event.get("requestId"), False, event.get("response", {}).get("headers", {}), event.get("response", {}).get("status"), event.get("response", {}).get("statusText")))

@@ -24,17 +24,10 @@ class NetworkRecorder:
         self.active_transactions = {}
         self.loader_to_seq = {}
         
-        # Bridging maps
         self.pw_to_cdp = {} # Playwright id(request) -> CDP requestId
-        
-        # FIFO queues used exclusively as a bridge, because Playwright Python 
-        # does not expose the underlying CDP requestId on the Request object.
-        # LIMITATION: This relies on the strict sequential emission order of Chromium events.
-        self.unmatched_playwright_requests: Dict[Tuple[str, str], list] = defaultdict(list)
-        self.unmatched_cdp_requests: Dict[Tuple[str, str], list] = defaultdict(list)
-        # Timestamps for TTL eviction of stale unmatched entries (keyed by id())
-        self._unmatched_timestamps: Dict[int, float] = {}
-        self._UNMATCHED_TTL_SEC = 60  # evict after 60 seconds if never bridged
+        self.cdp_timing_fps = {} # cdp_timing_fp -> requestId
+        self.cdp_unmatched_requests = defaultdict(list) # Fallback for requests that failed
+        self.unmatched_playwright_requests = defaultdict(list)
         
         self.active_websockets: Dict[str, WebSocketState] = {}
         self.unmatched_cdp_websockets: Dict[str, list] = defaultdict(list)
@@ -109,7 +102,6 @@ class NetworkRecorder:
         key = (url, method)
         
         with self.lock:
-            self._evict_stale_unmatched()
             
             # 1. Create the authoritative transaction state mapped to CDP requestId
             self.seq_counter += 1
@@ -133,25 +125,33 @@ class NetworkRecorder:
             
             self.active_transactions[request_id] = txn
             
+            # For fallback (failed requests without timing)
+            self.cdp_unmatched_requests[key].append(request_id)
+            
+            # Enrich from pending Playwright requests if available
+            if self.unmatched_playwright_requests[key]:
+                pw_req = self.unmatched_playwright_requests[key].pop(0)
+                self.pw_to_cdp[id(pw_req)] = request_id
+                self._enrich_transaction_from_playwright(txn, pw_req)
             loader_id = event.get("loaderId")
             if loader_id and event.get("type") == "Document":
                 self.loader_to_seq[loader_id] = seq
             
-            # 2. Bridge to Playwright
-            if self.unmatched_playwright_requests[key]:
-                # A Playwright request already arrived and is waiting for CDP
-                pw_req = self.unmatched_playwright_requests[key].pop(0)
-                pw_id = id(pw_req)
-                self._unmatched_timestamps.pop(pw_id, None)
-                self.pw_to_cdp[pw_id] = request_id
-                self._enrich_transaction_from_playwright(txn, pw_req)
-            else:
-                self.unmatched_cdp_requests[key].append(request_id)
-                self._unmatched_timestamps[id(request_id)] = time.time()
-                
             self.gui_queue.put(GUIEvent(type="STARTED", transaction=txn))
 
 
+
+    def attach_cdp_response(self, event: dict):
+        if not self.recording: return
+        request_id = event.get("requestId")
+        resp = event.get("response", {})
+        t = resp.get("timing")
+        if t:
+            fp = f"{t.get('dnsStart')}_{t.get('dnsEnd')}_{t.get('connectStart')}_{t.get('connectEnd')}_{t.get('sendStart')}_{t.get('receiveHeadersEnd')}"
+            with self.lock:
+                if fp not in self.cdp_timing_fps:
+                    self.cdp_timing_fps[fp] = []
+                self.cdp_timing_fps[fp].append(request_id)
 
     def attach_cdp_websocket(self, url: str, request_id: str, page_id: str, event: dict):
         if not self.recording: return
@@ -264,16 +264,17 @@ class NetworkRecorder:
         pw_id = id(request)
         
         with self.lock:
-            if self.unmatched_cdp_requests[key]:
-                cdp_id = self.unmatched_cdp_requests[key].pop(0)
+            # We just enrich if a CDP transaction is waiting.
+            # This FIFO is safe because identical requests at this stage are indistinguishable.
+            # The REAL correlation happens at handle_response/finished using timing.
+            if self.cdp_unmatched_requests[key]:
+                cdp_id = self.cdp_unmatched_requests[key].pop(0)
                 self.pw_to_cdp[pw_id] = cdp_id
                 txn = self.active_transactions.get(cdp_id)
                 if txn:
                     self._enrich_transaction_from_playwright(txn, request)
             else:
                 self.unmatched_playwright_requests[key].append(request)
-
-
 
     def _enrich_transaction_from_playwright(self, txn: TransactionState, request):
         # Override with rich Playwright data if available
@@ -305,8 +306,19 @@ class NetworkRecorder:
         pw_id = id(response.request)
         ts = datetime.now().isoformat()
         
+        t = response.request.timing
+        
         with self.lock:
+            # DETERMINISTIC CORRELATION
             cdp_id = self.pw_to_cdp.get(pw_id)
+            if t:
+                fp = f"{t.get('domainLookupStart')}_{t.get('domainLookupEnd')}_{t.get('connectStart')}_{t.get('connectEnd')}_{t.get('requestStart')}_{t.get('responseStart')}"
+                if fp in self.cdp_timing_fps and self.cdp_timing_fps[fp]:
+                    # Exact match overrides the initial FIFO guess!
+                    exact_cdp_id = self.cdp_timing_fps[fp].pop(0)
+                    cdp_id = exact_cdp_id
+                    self.pw_to_cdp[pw_id] = cdp_id
+            
             if not cdp_id: return
             txn = self.active_transactions.get(cdp_id)
             if not txn: return
