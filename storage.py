@@ -41,9 +41,10 @@ class StorageManager:
         
         self.lock = threading.RLock()
         
-        # Buffer for completed transactions to ensure chronological logging based on sequence
-        self.completed_txns = {}
-        self.next_seq_to_write = 1
+        # Completed transactions are written immediately to disk as they arrive.
+        # Sequence numbers are embedded in every record for post-hoc ordering.
+        # (old strict-sequential buffer removed — it caused permanent write blockage
+        #  when any single request never finalized, e.g. aborted or long-polling.)
         
         self.dom_sequence = {} # (page_id, frame_id) -> int
 
@@ -248,16 +249,9 @@ class StorageManager:
     def finalize_transaction(self, txn: TransactionState):
         with self.lock:
             self._update_stats(txn)
-            self.completed_txns[txn.sequence] = txn
-            self._drain_completed()
-            
-    def _drain_completed(self):
-        # We write completed transactions exactly in their request sequence order.
-        while self.next_seq_to_write in self.completed_txns:
-            txn = self.completed_txns.pop(self.next_seq_to_write)
+            # Write immediately — no sequential buffering
             self._write_to_log(txn)
             self._write_to_manifest(txn)
-            self.next_seq_to_write += 1
 
     def _write_to_manifest(self, txn: TransactionState):
         try:
@@ -431,13 +425,6 @@ class StorageManager:
 
     def finalize(self):
         with self.lock:
-            # Drain any remaining completed or force-flush stalled out-of-order ones
-            keys = sorted(list(self.completed_txns.keys()))
-            for k in keys:
-                txn = self.completed_txns.pop(k)
-                self._write_to_log(txn)
-                self._write_to_manifest(txn)
-                
             self.write_session_info()
             self._write_session_summary()
 

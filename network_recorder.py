@@ -32,6 +32,9 @@ class NetworkRecorder:
         # LIMITATION: This relies on the strict sequential emission order of Chromium events.
         self.unmatched_playwright_requests: Dict[Tuple[str, str], list] = defaultdict(list)
         self.unmatched_cdp_requests: Dict[Tuple[str, str], list] = defaultdict(list)
+        # Timestamps for TTL eviction of stale unmatched entries (keyed by id())
+        self._unmatched_timestamps: Dict[int, float] = {}
+        self._UNMATCHED_TTL_SEC = 60  # evict after 60 seconds if never bridged
         
         self.active_websockets: Dict[str, WebSocketState] = {}
         self.unmatched_cdp_websockets: Dict[str, list] = defaultdict(list)
@@ -41,6 +44,27 @@ class NetworkRecorder:
         with self.lock:
             self.seq_counter += 1
             return self.seq_counter
+
+    def _evict_stale_unmatched(self):
+        """Remove unmatched entries older than _UNMATCHED_TTL_SEC. Call under self.lock."""
+        now = time.time()
+        cutoff = now - self._UNMATCHED_TTL_SEC
+        for key in list(self.unmatched_playwright_requests.keys()):
+            alive = [r for r in self.unmatched_playwright_requests[key]
+                     if self._unmatched_timestamps.get(id(r), now) >= cutoff]
+            evicted = len(self.unmatched_playwright_requests[key]) - len(alive)
+            if evicted:
+                logger.debug(f"Evicted {evicted} stale unmatched PW requests for {key}")
+                self._unmatched_timestamps = {k: v for k, v in self._unmatched_timestamps.items()
+                                              if any(id(r) == k for r in alive)}
+            self.unmatched_playwright_requests[key] = alive
+        for key in list(self.unmatched_cdp_requests.keys()):
+            alive = [r for r in self.unmatched_cdp_requests[key]
+                     if self._unmatched_timestamps.get(id(r), now) >= cutoff]
+            evicted = len(self.unmatched_cdp_requests[key]) - len(alive)
+            if evicted:
+                logger.debug(f"Evicted {evicted} stale unmatched CDP requests for {key}")
+            self.unmatched_cdp_requests[key] = alive
             
     def start_recording(self):
         self.recording = True
@@ -85,6 +109,8 @@ class NetworkRecorder:
         key = (url, method)
         
         with self.lock:
+            self._evict_stale_unmatched()
+            
             # 1. Create the authoritative transaction state mapped to CDP requestId
             self.seq_counter += 1
             seq = self.seq_counter
@@ -116,10 +142,12 @@ class NetworkRecorder:
                 # A Playwright request already arrived and is waiting for CDP
                 pw_req = self.unmatched_playwright_requests[key].pop(0)
                 pw_id = id(pw_req)
+                self._unmatched_timestamps.pop(pw_id, None)
                 self.pw_to_cdp[pw_id] = request_id
                 self._enrich_transaction_from_playwright(txn, pw_req)
             else:
                 self.unmatched_cdp_requests[key].append(request_id)
+                self._unmatched_timestamps[id(request_id)] = time.time()
                 
             self.gui_queue.put(GUIEvent(type="STARTED", transaction=txn))
 
@@ -281,15 +309,16 @@ class NetworkRecorder:
             cdp_id = self.pw_to_cdp.get(pw_id)
             if not cdp_id: return
             txn = self.active_transactions.get(cdp_id)
+            if not txn: return
             
-        if not txn: return
-            
-        txn.response_time = ts
-        txn.status = response.status
-        txn.status_text = response.status_text
-        txn.response_headers = response.headers
-        txn.content_type = response.headers.get("content-type", "")
+            # All mutations inside the lock to prevent concurrent thread corruption
+            txn.response_time = ts
+            txn.status = response.status
+            txn.status_text = response.status_text
+            txn.response_headers = response.headers
+            txn.content_type = response.headers.get("content-type", "")
         
+        # Body read is blocking I/O — do outside the lock but after fields are safely set
         if config.save_response_bodies:
             try:
                 body = response.body()

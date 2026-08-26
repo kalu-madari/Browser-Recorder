@@ -32,6 +32,7 @@ class BrowserManager(threading.Thread):
         self.latest_nav_id = {}
         self.latest_dom_id = {}
         self.interaction_counter = 0
+        self.primary_page = None
         
     def run(self):
         print("DEBUG: BROWSER MANAGER RUN THREAD STARTED")
@@ -102,31 +103,16 @@ class BrowserManager(threading.Thread):
         return path.join(" > ");
     }
 
-    function isSensitive(el) {
-        if (!el) return false;
-        const sensitiveTypes = ['password', 'hidden'];
-        if (el.tagName === 'INPUT' && sensitiveTypes.includes(el.type.toLowerCase())) return true;
-        const name = (el.name || '').toLowerCase();
-        const id = (el.id || '').toLowerCase();
-        const sensitiveWords = ['password', 'token', 'cvv', 'secret', 'creditcard', 'cc_number', 'card'];
-        return sensitiveWords.some(w => name.includes(w) || id.includes(w));
-    }
-
     function interactionHandler(event) {
         const target = event.target;
         let targetTag = target ? (target.tagName ? target.tagName.toLowerCase() : 'unknown') : 'unknown';
         let targetSelector = target ? getCssSelector(target) : '';
         let targetText = target ? (target.innerText ? target.innerText.substring(0, 100) : '') : '';
         
+        // Capture all values — no sensitive filtering
         let targetValue = null;
-        let isSens = isSensitive(target);
-        
         if (targetTag === 'input' || targetTag === 'textarea' || targetTag === 'select') {
-            if (!isSens) {
-                targetValue = target.value;
-            } else {
-                targetValue = "[SENSITIVE]";
-            }
+            targetValue = target.value;
         }
         
         let coordinates = null;
@@ -174,10 +160,11 @@ class BrowserManager(threading.Thread):
                     print("DEBUG: Navigating to", self.start_url)
                     page.goto(self.start_url)
                     print("DEBUG: Navigated successfully")
-                    # Trigger popup after short delay
-                    page.evaluate("setTimeout(() => window.open('http://127.0.0.1:8080/popup.html'), 1000)")
                 else:
                     page.goto("about:blank")
+                
+                # Track the primary page so command handlers always target the right page
+                self.primary_page = page
                 
                 while self.running:
                     if not self.context.pages:
@@ -203,36 +190,42 @@ class BrowserManager(threading.Thread):
                         elif cmd.get("action") == "navigation_failed":
                             self._handle_navigation_failed(cmd.get("page_id"), cmd.get("event"))
                         elif cmd.get("action") == "evaluate":
-                            if self.context.pages:
+                            pg = self.primary_page
+                            if pg and not pg.is_closed():
                                 try:
-                                    self.context.pages[0].evaluate(cmd.get("js"))
+                                    pg.evaluate(cmd.get("js"))
                                 except Exception as e:
                                     logger.error(f"Evaluate error: {e}")
                         elif cmd.get("action") == "goto":
-                            if self.context.pages:
-                                try: self.context.pages[0].goto(cmd.get("url"))
+                            pg = self.primary_page
+                            if pg and not pg.is_closed():
+                                try: pg.goto(cmd.get("url"))
                                 except Exception as e: logger.error(f"goto error: {e}")
                         elif cmd.get("action") == "go_back":
-                            if self.context.pages:
-                                try: self.context.pages[0].go_back()
+                            pg = self.primary_page
+                            if pg and not pg.is_closed():
+                                try: pg.go_back()
                                 except Exception as e: logger.error(f"go_back error: {e}")
                         elif cmd.get("action") == "go_forward":
-                            if self.context.pages:
-                                try: self.context.pages[0].go_forward()
+                            pg = self.primary_page
+                            if pg and not pg.is_closed():
+                                try: pg.go_forward()
                                 except Exception as e: logger.error(f"go_forward error: {e}")
                         elif cmd.get("action") == "reload":
-                            if self.context.pages:
-                                try: self.context.pages[0].reload()
+                            pg = self.primary_page
+                            if pg and not pg.is_closed():
+                                try: pg.reload()
                                 except Exception as e: logger.error(f"reload error: {e}")
                         elif cmd.get("action") == "iframe_eval":
-                            if self.context.pages:
-                                try: self.context.pages[0].frame_locator("#ifr").evaluate(cmd.get("js"))
+                            pg = self.primary_page
+                            if pg and not pg.is_closed():
+                                try: pg.frame_locator("#ifr").evaluate(cmd.get("js"))
                                 except Exception as e: logger.error(f"iframe_eval error: {e}")
                         elif cmd.get("action") == "new_page":
                             try:
-                                page = self.context.new_page()
-                                page.wait_for_timeout(1000) # Wait for CDP to attach via event loop
-                                page.goto(cmd.get("url"))
+                                new_pg = self.context.new_page()
+                                new_pg.wait_for_timeout(1000)
+                                new_pg.goto(cmd.get("url"))
                             except Exception as e: logger.error(f"new_page error: {e}")
                         elif cmd.get("action") == "close_page":
                             if len(self.context.pages) > 1:
@@ -244,7 +237,10 @@ class BrowserManager(threading.Thread):
                         pass
                         
                     try:
-                        if self.context.pages:
+                        pg = self.primary_page
+                        if pg and not pg.is_closed():
+                            pg.wait_for_timeout(100)
+                        elif self.context.pages:
                             self.context.pages[0].wait_for_timeout(100)
                     except Exception:
                         if not self.context.pages:
@@ -467,17 +463,8 @@ class BrowserManager(threading.Thread):
         from models import InteractionRecord
         
         target_value = payload.get("target_value")
-        value_recorded = False
-        
-        if target_value == "[SENSITIVE]":
-            target_value = None
-            value_recorded = False
-        elif target_value is not None:
-            if config.record_text_input_values:
-                value_recorded = True
-            else:
-                target_value = None
-                value_recorded = False
+        # Always record value — no filtering
+        value_recorded = target_value is not None
                 
         record = InteractionRecord(
             interaction_id=interaction_id,

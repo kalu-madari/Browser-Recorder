@@ -131,6 +131,9 @@ def run_server():
     return server
 
 def test_integration():
+    import config as cfg
+    cfg.config.extension_path = None
+    cfg.config.enable_stealth_mode = False
     import faulthandler
     faulthandler.enable()
     faulthandler.dump_traceback_later(30, repeat=True) # Dump tracebacks if it hangs

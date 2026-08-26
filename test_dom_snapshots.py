@@ -100,6 +100,9 @@ class TestDOMSnapshots(unittest.TestCase):
             shutil.rmtree(cls.test_dir)
 
     def test_dom_snapshots(self):
+        import config as cfg
+        cfg.config.extension_path = None
+        cfg.config.enable_stealth_mode = False
         import shutil
             
         q = queue.Queue()

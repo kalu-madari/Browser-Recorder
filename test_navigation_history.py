@@ -53,6 +53,9 @@ def run_server():
     return server
 
 def test_navigation_history():
+    import config as cfg
+    cfg.config.extension_path = None
+    cfg.config.enable_stealth_mode = False
     config.enable_cdp = True
     config.enable_dom_snapshots = True
     

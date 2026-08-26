@@ -28,7 +28,7 @@ def main():
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     
     # Simple warning label at bottom
-    warn_lbl = tk.Label(root, text="WARNING: Network captures may contain passwords, cookies, tokens, and other sensitive personal data.", fg="red")
+    warn_lbl = tk.Label(root, text="WARNING: Network captures may contain passwords, cookies, tokens, and other sensitive personal data.", fg="#d32f2f", bg="#f5f5f5", font=("Segoe UI", 9))
     warn_lbl.pack(side=tk.BOTTOM, pady=5)
     
     root.mainloop()

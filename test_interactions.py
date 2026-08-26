@@ -51,6 +51,9 @@ def run_server():
     return server
 
 def test_interactions():
+    import config as cfg
+    cfg.config.extension_path = None
+    cfg.config.enable_stealth_mode = False
     server = run_server()
     
     # Configure config for test
@@ -162,19 +165,20 @@ def test_interactions():
     assert clicks[0]['coordinates']['x'] == 100, "Click coordinates incorrect"
     
     # Check sensitive filtering
+    # The user explicitly requested NO filtering, so the secret value should now be captured
     secret_inputs = [i for i in interactions if i['event_type'] == 'input' and i['target_selector'].endswith('#secret_input')]
-    assert len(secret_inputs) >= 1, "Secret input not captured"
-    assert secret_inputs[0]['target_value'] is None, "Secret value should be filtered"
+    assert len(secret_inputs) == 1
+    assert secret_inputs[0]['target_value'] == 'supersecret', "Secret value should be captured now"
     
     token_inputs = [i for i in interactions if i['event_type'] == 'input' and i['target_selector'].endswith('#token_field')]
     assert len(token_inputs) >= 1, "Token input not captured"
-    assert token_inputs[0]['target_value'] is None, "Token value should be filtered due to name"
+    assert token_inputs[0]['target_value'] == 'mytoken123', "Token value should be captured now"
     
-    # Check text input values (first should be None, second should be hello2)
+    # Check text input values (values are always recorded now)
     normal_inputs = [i for i in interactions if i['event_type'] == 'input' and i['target_selector'].endswith('#normal_input')]
     assert len(normal_inputs) >= 2, "Normal inputs not captured"
-    assert normal_inputs[0]['target_value'] is None, "First normal input should not be recorded (config)"
-    assert normal_inputs[0]['value_recorded'] is False, "First normal input value_recorded should be false"
+    assert normal_inputs[0]['target_value'] == 'hello', "First normal input should be recorded"
+    assert normal_inputs[0]['value_recorded'] is True, "First normal input value_recorded should be true"
     
     assert normal_inputs[-1]['target_value'] == 'hello2', "Second normal input should be recorded"
     assert normal_inputs[-1]['value_recorded'] is True, "Second normal input value_recorded should be true"

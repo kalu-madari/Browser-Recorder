@@ -1,5 +1,19 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+# Project root — the directory this file lives in
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+def _default_extension_path() -> str:
+    env = os.environ.get("BROWSER_RECORDER_EXTENSION_PATH", "")
+    if env:
+        return env
+    local = os.path.join(_HERE, "extensions", "cookie-editor")
+    return local if os.path.isdir(local) else ""
+
+def _default_user_data_dir() -> str:
+    env = os.environ.get("BROWSER_RECORDER_USER_DATA_DIR", "")
+    return env if env else os.path.join(_HERE, "user_data")
 
 @dataclass
 class AppConfig:
@@ -21,7 +35,7 @@ class AppConfig:
     enable_interactions: bool = True
     record_text_input_values: bool = False
     enable_stealth_mode: bool = True
-    extension_path: str = r"C:\Users\navee\browser_recorder\extensions\cookie-editor"
-    user_data_dir: str = r"C:\Users\navee\browser_recorder\user_data"
+    extension_path: str = field(default_factory=_default_extension_path)
+    user_data_dir: str = field(default_factory=_default_user_data_dir)
 
 config = AppConfig()

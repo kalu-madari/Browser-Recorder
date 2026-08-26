@@ -18,6 +18,22 @@ class AppGUI:
         self.root.title("Browser Network Recorder")
         self.root.geometry("1100x700")
         
+        # Apply theme and styles
+        self.style = ttk.Style()
+        if "clam" in self.style.theme_names():
+            self.style.theme_use("clam")
+            
+        self.bg_color = "#f5f5f5"
+        self.root.configure(background=self.bg_color)
+        
+        self.style.configure("TFrame", background=self.bg_color)
+        self.style.configure("TLabel", background=self.bg_color, font=("Segoe UI", 10))
+        self.style.configure("TLabelframe", background=self.bg_color)
+        self.style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"), background=self.bg_color)
+        self.style.configure("TButton", font=("Segoe UI", 10))
+        self.style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
+        self.style.configure("Treeview", font=("Segoe UI", 9), rowheight=25)
+        
         self.gui_queue = queue.Queue()
         self.gui_msg_queue = queue.Queue()
         self.storage = None
@@ -28,38 +44,48 @@ class AppGUI:
         self.poll_queues()
         
     def setup_ui(self):
-        top_frame = tk.Frame(self.root)
-        top_frame.pack(fill=tk.X, padx=10, pady=5)
+        # Top Controls Frame
+        top_frame = ttk.Frame(self.root)
+        top_frame.pack(fill=tk.X, padx=15, pady=10)
         
-        self.btn_launch = tk.Button(top_frame, text="Launch Browser", command=self.launch_browser, width=15)
-        self.btn_launch.pack(side=tk.LEFT, padx=5)
-        self.btn_start = tk.Button(top_frame, text="Start Recording", command=self.start_recording, state=tk.DISABLED, width=15)
+        self.btn_launch = ttk.Button(top_frame, text="Launch Browser", command=self.launch_browser, width=15)
+        self.btn_launch.pack(side=tk.LEFT, padx=(0, 5))
+        self.btn_start = ttk.Button(top_frame, text="Start Recording", command=self.start_recording, state=tk.DISABLED, width=15)
         self.btn_start.pack(side=tk.LEFT, padx=5)
-        self.btn_stop = tk.Button(top_frame, text="Stop Recording", command=self.stop_recording, state=tk.DISABLED, width=15)
+        self.btn_stop = ttk.Button(top_frame, text="Stop Recording", command=self.stop_recording, state=tk.DISABLED, width=15)
         self.btn_stop.pack(side=tk.LEFT, padx=5)
-        tk.Button(top_frame, text="New Session", command=self.new_session, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_frame, text="New Session", command=self.new_session, width=15).pack(side=tk.LEFT, padx=5)
         
-        self.lbl_browser_status = tk.Label(top_frame, text="Browser: Stopped", fg="gray")
+        # Status indicator
+        self.lbl_browser_status = tk.Label(top_frame, text="Browser: Stopped", fg="#666666", bg=self.bg_color, font=("Segoe UI", 10, "bold"))
         self.lbl_browser_status.pack(side=tk.RIGHT, padx=10)
         
-        dir_frame = tk.Frame(self.root)
-        dir_frame.pack(fill=tk.X, padx=10, pady=5)
-        tk.Label(dir_frame, text="Output Directory:").pack(side=tk.LEFT)
+        # Directory configuration
+        dir_frame = ttk.Frame(self.root)
+        dir_frame.pack(fill=tk.X, padx=15, pady=5)
+        ttk.Label(dir_frame, text="Output Directory:").pack(side=tk.LEFT)
         self.dir_var = tk.StringVar(value=os.path.abspath(config.output_dir))
-        tk.Entry(dir_frame, textvariable=self.dir_var, width=60).pack(side=tk.LEFT, padx=5)
-        tk.Button(dir_frame, text="Browse", command=self.browse_dir).pack(side=tk.LEFT)
+        ttk.Entry(dir_frame, textvariable=self.dir_var, width=60).pack(side=tk.LEFT, padx=10)
+        ttk.Button(dir_frame, text="Browse", command=self.browse_dir).pack(side=tk.LEFT)
         
-        stats_frame = tk.LabelFrame(self.root, text="Statistics", padx=5, pady=5)
-        stats_frame.pack(fill=tk.X, padx=10, pady=5)
+        # Statistics Panel
+        stats_frame = ttk.LabelFrame(self.root, text="Statistics", padding=10)
+        stats_frame.pack(fill=tk.X, padx=15, pady=10)
         
-        self.lbl_stats = tk.Label(stats_frame, text="Ready. Click 'Launch Browser' to begin.", justify=tk.LEFT, font=("Consolas", 10))
-        self.lbl_stats.pack(anchor=tk.W, padx=5, pady=5)
+        self.lbl_stats = tk.Label(stats_frame, text="Ready. Click 'Launch Browser' to begin.", justify=tk.LEFT, font=("Consolas", 10), bg=self.bg_color)
+        self.lbl_stats.pack(anchor=tk.W)
         
-        tree_frame = tk.Frame(self.root)
-        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        # Data View (Treeview)
+        tree_frame = ttk.Frame(self.root)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=(5, 15))
         
         cols = ("Seq", "Time", "Type", "Method", "Status", "Size", "URL")
         self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="browse")
+        
+        # Tag configuration for alternating rows
+        self.tree.tag_configure('evenrow', background="#fdfdfd")
+        self.tree.tag_configure('oddrow', background="#f4f4f9")
+        self.tree.tag_configure('error', foreground="#d32f2f")
         
         self.tree.heading("Seq", text="Seq")
         self.tree.column("Seq", width=70, anchor=tk.CENTER)
@@ -94,7 +120,7 @@ class AppGUI:
             return
             
         self.btn_launch.config(state=tk.DISABLED)
-        self.lbl_browser_status.config(text="Browser: Starting...", fg="orange")
+        self.lbl_browser_status.config(text="Browser: Starting...", fg="#ff9800")
         
         base_dir = self.dir_var.get()
         self.storage = StorageManager(base_dir)
@@ -140,10 +166,10 @@ class AppGUI:
                 if msg["type"] == "STATE":
                     state = msg["state"]
                     if state == "READY":
-                        self.lbl_browser_status.config(text="Browser: Running", fg="green")
+                        self.lbl_browser_status.config(text="Browser: Running", fg="#4caf50")
                         self.btn_start.config(state=tk.NORMAL)
                     elif state == "CLOSED" or state == "ERROR":
-                        self.lbl_browser_status.config(text=f"Browser: {state}", fg="red")
+                        self.lbl_browser_status.config(text=f"Browser: {state}", fg="#f44336")
                         self.btn_start.config(state=tk.DISABLED)
                         self.btn_launch.config(state=tk.NORMAL)
                         self.stop_recording()
@@ -164,16 +190,21 @@ class AppGUI:
         finally:
             self.root.after(50, self.poll_queues)
             
-    def handle_gui_event(self, event: GUIEvent):
+    def handle_gui_event(self, event):
+        # Handle dictionary events (e.g. {"type": "COMPLETED"} or {"type": "WS_UPDATED"})
+        if isinstance(event, dict):
+            return
+            
         txn = event.transaction
         seq = f"{txn.sequence:06d}"
         time_str = txn.request_time.split('T')[-1][:12]
         
         if event.type == "STARTED":
+            tags = ('evenrow',) if txn.sequence % 2 == 0 else ('oddrow',)
             item = self.tree.insert("", "end", values=(
                 seq, time_str, txn.resource_type, txn.method,
                 "(pending)", "", txn.url
-            ))
+            ), tags=tags)
             self.tree_item_map[txn.sequence] = item
             
             # Auto-truncate UI tree to avoid memory bloat
@@ -191,13 +222,17 @@ class AppGUI:
                     size_str = f"{txn.resource.size} B"
                 
                 status_str = str(txn.status) if txn.status else ""
-                if event.type == "FAILED":
-                    status_str = "FAILED"
+                
+                tags = ('evenrow',) if txn.sequence % 2 == 0 else ('oddrow',)
+                if event.type == "FAILED" or (txn.status and txn.status >= 400):
+                    if event.type == "FAILED":
+                        status_str = "FAILED"
+                    tags = ('error',)
                     
                 self.tree.item(item, values=(
                     seq, time_str, txn.resource_type, txn.method,
                     status_str, size_str, txn.url
-                ))
+                ), tags=tags)
             
     def update_stats(self):
         if self.storage:
