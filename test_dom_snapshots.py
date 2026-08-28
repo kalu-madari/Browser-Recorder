@@ -175,8 +175,9 @@ class TestDOMSnapshots(unittest.TestCase):
                 self.assertEqual(actual_sha256, expected_sha256)
                 self.assertEqual(size, rec['html_size'])
             
-        page_1_records = [r for r in records if r['page_id'] == 'page-001' and r['frame_id'] == 'main']
-        page_1_iframe = [r for r in records if r['page_id'] == 'page-001' and 'test-iframe' in r['frame_id']]
+        # The main frame is no longer literal 'main', but the one where frame_id is present and we can check 'test-iframe' absence.
+        page_1_records = [r for r in records if r['page_id'] == 'page-001' and 'test-iframe' not in r['url']]
+        page_1_iframe = [r for r in records if r['page_id'] == 'page-001' and 'test-iframe' in r['url']]
         
         initial = next((r for r in page_1_records if r['reason'] == 'initial_load'), None)
         self.assertIsNotNone(initial)

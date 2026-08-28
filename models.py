@@ -54,6 +54,7 @@ class TransactionState:
     request_time: str
     resource_type: str
     page_id: str
+    frame_id: str
     frame_url: str
     
     post_data: Optional[str] = None
@@ -125,6 +126,7 @@ class NavigationRecord:
 @dataclass
 class InteractionRecord:
     interaction_id: str
+    sequence: int
     page_id: str
     frame_id: str
     timestamp: str

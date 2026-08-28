@@ -306,7 +306,11 @@ class BrowserManager(threading.Thread):
     def _handle_navigation_event(self, page_id, event, is_within_document):
         frame = event.get("frame", {}) if not is_within_document else event
         is_main = frame.get("parentId") is None
-        frame_id = "main" if is_main else (frame.get("id") or frame.get("frameId") or "unknown")
+        frame_id = frame.get("id") or frame.get("frameId") or "unknown"
+        
+        # Proactively map main frame
+        if is_main and self.primary_page and not self.primary_page.is_closed():
+            self.recorder.frame_registry.map_frame(self.primary_page.main_frame, frame_id)
         to_url = frame.get("url", "")
         
         nav_type_cdp = event.get("type", "unknown") if not is_within_document else "navigatedWithinDocument"
@@ -392,8 +396,9 @@ class BrowserManager(threading.Thread):
                 import datetime
                 from models import DOMSnapshotRecord
                 
-                # Determine frame id string
-                f_id = "main" if frame == frame.page.main_frame else (frame.name or f"frame-{id(frame)}")
+                # Determine canonical frame id
+                
+                f_id = self.recorder.frame_registry.get_cdp_frame_id(frame) or "unknown"
                 
                 # Use predefined dom_snapshot_id if this is the exact frame that navigated
                 assigned_id = ""
@@ -455,10 +460,13 @@ class BrowserManager(threading.Thread):
             return
             
         page_id = getattr(page, '_page_id', 'unknown')
-        f_id = "main" if frame == page.main_frame else (frame.name or f"frame-{id(frame)}")
-        
+        canonical_frame_id = self.recorder.frame_registry.get_cdp_frame_id(frame) or "unknown"
         self.interaction_counter += 1
         interaction_id = f"int-{self.interaction_counter:06d}"
+        
+        with self.recorder.lock:
+            self.recorder.seq_counter += 1
+            seq = self.recorder.seq_counter
         
         import datetime
         from models import InteractionRecord
@@ -469,8 +477,9 @@ class BrowserManager(threading.Thread):
                 
         record = InteractionRecord(
             interaction_id=interaction_id,
+            sequence=seq,
             page_id=page_id,
-            frame_id=f_id,
+            frame_id=canonical_frame_id,
             timestamp=datetime.datetime.now().isoformat(),
             event_type=payload.get("event_type"),
             target_tag=payload.get("target_tag"),
@@ -480,8 +489,8 @@ class BrowserManager(threading.Thread):
             value_recorded=value_recorded,
             coordinates=payload.get("coordinates"),
             key=payload.get("key"),
-            dom_snapshot_id=self.latest_dom_id.get(f_id),
-            navigation_id=self.latest_nav_id.get(f_id),
+            dom_snapshot_id=self.latest_dom_id.get(canonical_frame_id),
+            navigation_id=self.latest_nav_id.get(canonical_frame_id),
             is_trusted=payload.get("is_trusted", False)
         )
         self.recorder.storage.save_interaction_record(record)

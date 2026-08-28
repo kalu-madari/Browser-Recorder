@@ -12,8 +12,6 @@ from storage import StorageManager
 from config import config
 
 logger = logging.getLogger(__name__)
-
-
 # ---------------------------------------------------------------------------
 # Intermediate pending records — kept separate until fingerprint proves match
 # ---------------------------------------------------------------------------
@@ -34,10 +32,9 @@ class PendingCDPRecord:
     initiator: Optional[dict]
     resource_type: str
     page_id: str
+    frame_id: str
     request_time: str
     loader_id: Optional[str] = None
-
-
 @dataclass
 class PendingPWRecord:
     """
@@ -48,6 +45,8 @@ class PendingPWRecord:
     No CDP requestId is stored here. No FIFO lookup is performed.
     """
     pw_id: int           # id(playwright_request)
+    page_id: str
+    pw_frame: Any
     url: str
     method: str
     request_headers: dict
@@ -64,8 +63,6 @@ class PendingPWRecord:
     response_status_text: Optional[str] = None
     response_headers: Optional[dict] = None
     content_type: Optional[str] = None
-
-
 def _format_milestone(val: Any) -> Optional[float]:
     if val is None:
         return None
@@ -74,8 +71,6 @@ def _format_milestone(val: Any) -> Optional[float]:
         return f
     except (ValueError, TypeError):
         return None
-
-
 def compute_cdp_timing_fingerprint(timing: Optional[dict]) -> Optional[str]:
     """
     Compute timing fingerprint from CDP Network.responseReceived timing dict.
@@ -95,8 +90,6 @@ def compute_cdp_timing_fingerprint(timing: Optional[dict]) -> Optional[str]:
     if not any(m is not None and m >= 0 for m in milestones):
         return None
     return "_".join(f"{m:.3f}" if m is not None else "None" for m in milestones)
-
-
 def compute_pw_timing_fingerprint(timing: Optional[dict]) -> Optional[str]:
     """
     Compute timing fingerprint from Playwright request.timing dict.
@@ -115,8 +108,31 @@ def compute_pw_timing_fingerprint(timing: Optional[dict]) -> Optional[str]:
     if not any(m is not None and m >= 0 for m in milestones):
         return None
     return "_".join(f"{m:.3f}" if m is not None else "None" for m in milestones)
+class FrameRegistry:
+    def __init__(self):
+        import threading
+        self.lock = threading.RLock()
+        self._mapping = {} # guid -> cdp_frame_id
 
+    def _get_key(self, pw_frame) -> str:
+        impl = getattr(pw_frame, '_impl_obj', pw_frame)
+        guid = getattr(impl, '_guid', None)
+        if guid: return guid
+        return str(id(pw_frame))
 
+    def map_frame(self, pw_frame, cdp_frame_id: str):
+        if not pw_frame or not cdp_frame_id:
+            return
+        key = self._get_key(pw_frame)
+        with self.lock:
+            self._mapping[key] = cdp_frame_id
+
+    def get_cdp_frame_id(self, pw_frame):
+        if not pw_frame:
+            return None
+        key = self._get_key(pw_frame)
+        with self.lock:
+            return self._mapping.get(key) or "unknown"
 class NetworkRecorder:
     def __init__(self, storage: StorageManager, gui_queue: queue.Queue):
         self.storage = storage
@@ -124,6 +140,7 @@ class NetworkRecorder:
         self.seq_counter = 0
         self.lock = threading.RLock()
         self.recording = False
+        self.frame_registry = FrameRegistry()
 
         # -------------------------------------------------------------------
         # State-machine maps
@@ -193,6 +210,7 @@ class NetworkRecorder:
 
     def stop_recording(self):
         self.recording = False
+        self.frame_registry = FrameRegistry()
         logger.info("Stopping recording. Flushing pending records...")
 
         # Give in-flight requests up to 5 s to complete
@@ -228,6 +246,7 @@ class NetworkRecorder:
                     request_time=cdp_rec.request_time,
                     resource_type=cdp_rec.resource_type,
                     page_id=cdp_rec.page_id,
+                    frame_id=cdp_rec.frame_id,
                     frame_url="",
                     initiator=cdp_rec.initiator,
                     error="INCOMPLETE (CDP-only: no Playwright event observed)",
@@ -251,7 +270,8 @@ class NetworkRecorder:
                     request_headers=pw_rec.request_headers,
                     request_time=pw_rec.request_time,
                     resource_type=pw_rec.resource_type,
-                    page_id="",
+                    page_id=pw_rec.page_id,
+                    frame_id=self.frame_registry.get_cdp_frame_id(pw_rec.pw_frame) if getattr(pw_rec, "pw_frame", None) else "unknown",
                     frame_url=pw_rec.frame_url,
                     post_data=pw_rec.post_data,
                     post_data_file=pw_rec.post_data_file,
@@ -313,6 +333,7 @@ class NetworkRecorder:
                 initiator=initiator,
                 resource_type=event.get("type", "Fetch"),
                 page_id=page_id,
+                frame_id=event.get('frameId', 'unknown'),
                 request_time=ts,
                 loader_id=loader_id,
             )
@@ -333,6 +354,7 @@ class NetworkRecorder:
                 request_time=ts,
                 resource_type=record.resource_type,
                 page_id=page_id,
+                frame_id=event.get('frameId', 'unknown'),
                 frame_url="",
                 initiator=initiator,
                 correlation_state="PENDING_CDP",
@@ -406,6 +428,8 @@ class NetworkRecorder:
         with self.lock:
             record = PendingPWRecord(
                 pw_id=pw_id,
+                page_id=page_id,
+                pw_frame=request.frame,
                 url=request.url,
                 method=request.method,
                 request_headers=dict(request.headers),
@@ -466,6 +490,7 @@ class NetworkRecorder:
                             request_time=cdp_rec.request_time,
                             resource_type=pw_rec.resource_type if pw_rec else cdp_rec.resource_type,
                             page_id=cdp_rec.page_id,
+                            frame_id=cdp_rec.frame_id,
                             frame_url=pw_rec.frame_url if pw_rec else "",
                             initiator=cdp_rec.initiator,
                             post_data=pw_rec.post_data if pw_rec else None,
@@ -554,6 +579,8 @@ class NetworkRecorder:
                             del self.cdp_timing_fps[fp]
                         cdp_rec = self.pending_cdp.pop(cdp_id, None)
                         pw_rec = self.pending_pw.pop(pw_id, None)
+                        if cdp_rec and pw_rec and pw_rec.pw_frame and cdp_rec.frame_id:
+                            self.frame_registry.map_frame(pw_rec.pw_frame, cdp_rec.frame_id)
 
                         if cdp_rec:
                             merged_headers = dict(cdp_rec.request_headers)
@@ -569,6 +596,7 @@ class NetworkRecorder:
                                 request_time=cdp_rec.request_time,
                                 resource_type=pw_rec.resource_type if pw_rec else cdp_rec.resource_type,
                                 page_id=cdp_rec.page_id,
+                                frame_id=cdp_rec.frame_id,
                                 frame_url=pw_rec.frame_url if pw_rec else "",
                                 initiator=cdp_rec.initiator,
                                 post_data=pw_rec.post_data if pw_rec else None,
@@ -628,7 +656,8 @@ class NetworkRecorder:
                     request_headers=req_headers,
                     request_time=req_time,
                     resource_type=resource_type,
-                    page_id="",
+                    page_id=pw_rec.page_id if pw_rec else "",
+                    frame_id=self.frame_registry.get_cdp_frame_id(pw_rec.pw_frame) if (pw_rec and getattr(pw_rec, "pw_frame", None)) else "unknown",
                     frame_url=frame_url,
                     post_data=post_data,
                     post_data_file=post_data_file,
@@ -719,6 +748,8 @@ class NetworkRecorder:
                             del self.cdp_timing_fps[fp]
                         cdp_rec = self.pending_cdp.pop(cdp_id, None)
                         pw_rec = self.pending_pw.pop(pw_id, None)
+                        if cdp_rec and pw_rec and pw_rec.pw_frame and cdp_rec.frame_id:
+                            self.frame_registry.map_frame(pw_rec.pw_frame, cdp_rec.frame_id)
                         if cdp_rec:
                             merged_headers = dict(cdp_rec.request_headers)
                             if pw_rec:
@@ -732,6 +763,7 @@ class NetworkRecorder:
                                 request_time=cdp_rec.request_time,
                                 resource_type=pw_rec.resource_type if pw_rec else cdp_rec.resource_type,
                                 page_id=cdp_rec.page_id,
+                                frame_id=cdp_rec.frame_id,
                                 frame_url=pw_rec.frame_url if pw_rec else "",
                                 initiator=cdp_rec.initiator,
                                 post_data=pw_rec.post_data if pw_rec else None,
@@ -748,13 +780,23 @@ class NetworkRecorder:
                 if pw_rec:
                     txn = TransactionState(
                         id=f"pw-{pw_id}",
+
                         sequence=seq,
+
                         url=pw_rec.url,
+
                         method=pw_rec.method,
+
                         request_headers=pw_rec.request_headers,
+
                         request_time=pw_rec.request_time,
+
                         resource_type=pw_rec.resource_type,
-                        page_id="",
+
+                        page_id=pw_rec.page_id,
+
+                        frame_id=self.frame_registry.get_cdp_frame_id(pw_rec.pw_frame) if getattr(pw_rec, "pw_frame", None) else "unknown",
+
                         frame_url=pw_rec.frame_url,
                         post_data=pw_rec.post_data,
                         post_data_file=pw_rec.post_data_file,
@@ -764,13 +806,23 @@ class NetworkRecorder:
                 else:
                     txn = TransactionState(
                         id=f"pw-{pw_id}",
+
                         sequence=seq,
+
                         url=request.url,
+
                         method=request.method,
+
                         request_headers=dict(request.headers),
+
                         request_time=ts,
+
                         resource_type=request.resource_type,
+
                         page_id="",
+
+                        frame_id=self.frame_registry.get_cdp_frame_id(request.frame) if getattr(request, "frame", None) else "unknown",
+
                         frame_url=request.frame.url if request.frame else "",
                         correlation_state="PLAYWRIGHT_ONLY",
                     )
