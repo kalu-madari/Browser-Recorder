@@ -46,7 +46,7 @@ class ResourceRecord:
 
 @dataclass
 class TransactionState:
-    id: int  # Internal unique ID, mapped to id(Playwright Request)
+    id: str  # Internal unique ID, mapped to id(Playwright Request) or CDP requestId
     sequence: int
     url: str
     method: str
@@ -72,6 +72,10 @@ class TransactionState:
     error: Optional[str] = None
     completed: bool = False
     completion_time: Optional[str] = None
+
+    # State machine fields
+    finalized: bool = False          # Guards against duplicate manifest writes
+    correlation_state: str = "UNKNOWN"  # PENDING_CDP | PENDING_PW | CDP_CORRELATED | PLAYWRIGHT_ONLY | FINALIZED
 
     def to_dict(self) -> dict:
         d = asdict(self)

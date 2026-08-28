@@ -1,16 +1,121 @@
 import queue
 import logging
 import threading
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 import time
 from collections import defaultdict
-from typing import Dict, Tuple
 from models import TransactionState, ResourceRecord, GUIEvent, WebSocketFrame, WebSocketState
 from resource_classifier import determine_extension
 from storage import StorageManager
 from config import config
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Intermediate pending records — kept separate until fingerprint proves match
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PendingCDPRecord:
+    """
+    Holds data that arrived via CDP Network.requestWillBeSent.
+    Intentionally kept isolated from any Playwright data until the timing
+    fingerprint in handle_response/handle_request_finished proves which
+    Playwright Request object corresponds to this CDP requestId.
+    """
+    request_id: str
+    sequence: int
+    url: str
+    method: str
+    request_headers: dict
+    initiator: Optional[dict]
+    resource_type: str
+    page_id: str
+    request_time: str
+    loader_id: Optional[str] = None
+
+
+@dataclass
+class PendingPWRecord:
+    """
+    Holds data that arrived via Playwright handle_request.
+    Intentionally kept isolated from any CDP transaction until the timing
+    fingerprint proves which CDP requestId this Playwright Request belongs to.
+
+    No CDP requestId is stored here. No FIFO lookup is performed.
+    """
+    pw_id: int           # id(playwright_request)
+    url: str
+    method: str
+    request_headers: dict
+    resource_type: str
+    frame_url: str
+    request_cookies: list
+    post_data: Optional[str]
+    post_data_file: Optional[str]
+    request_time: str
+    request_obj: Any     # the Playwright Request object, for body reads in fallback
+    
+    # Stashed response data (in case handle_response fires before CDP fingerprint)
+    response_status: Optional[int] = None
+    response_status_text: Optional[str] = None
+    response_headers: Optional[dict] = None
+    content_type: Optional[str] = None
+
+
+def _format_milestone(val: Any) -> Optional[float]:
+    if val is None:
+        return None
+    try:
+        f = float(val)
+        return f
+    except (ValueError, TypeError):
+        return None
+
+
+def compute_cdp_timing_fingerprint(timing: Optional[dict]) -> Optional[str]:
+    """
+    Compute timing fingerprint from CDP Network.responseReceived timing dict.
+    Returns None if timing is absent, non-dict, or lacks positive timing milestones.
+    """
+    if not timing or not isinstance(timing, dict):
+        return None
+    milestones = [
+        _format_milestone(timing.get("dnsStart")),
+        _format_milestone(timing.get("dnsEnd")),
+        _format_milestone(timing.get("connectStart")),
+        _format_milestone(timing.get("connectEnd")),
+        _format_milestone(timing.get("sendStart")),
+        _format_milestone(timing.get("receiveHeadersEnd")),
+    ]
+    # Check if at least one meaningful positive timing milestone exists
+    if not any(m is not None and m >= 0 for m in milestones):
+        return None
+    return "_".join(f"{m:.3f}" if m is not None else "None" for m in milestones)
+
+
+def compute_pw_timing_fingerprint(timing: Optional[dict]) -> Optional[str]:
+    """
+    Compute timing fingerprint from Playwright request.timing dict.
+    Returns None if timing is absent, non-dict, or lacks positive timing milestones.
+    """
+    if not timing or not isinstance(timing, dict):
+        return None
+    milestones = [
+        _format_milestone(timing.get("domainLookupStart")),
+        _format_milestone(timing.get("domainLookupEnd")),
+        _format_milestone(timing.get("connectStart")),
+        _format_milestone(timing.get("connectEnd")),
+        _format_milestone(timing.get("requestStart")),
+        _format_milestone(timing.get("responseStart")),
+    ]
+    if not any(m is not None and m >= 0 for m in milestones):
+        return None
+    return "_".join(f"{m:.3f}" if m is not None else "None" for m in milestones)
+
 
 class NetworkRecorder:
     def __init__(self, storage: StorageManager, gui_queue: queue.Queue):
@@ -19,71 +124,151 @@ class NetworkRecorder:
         self.seq_counter = 0
         self.lock = threading.RLock()
         self.recording = False
-        
-        # Authoritative mapping: CDP requestId -> TransactionState
-        self.active_transactions = {}
-        self.loader_to_seq = {}
-        
-        self.pw_to_cdp = {} # Playwright id(request) -> CDP requestId
-        self.cdp_timing_fps = {} # cdp_timing_fp -> requestId
-        self.cdp_unmatched_requests = defaultdict(list) # Fallback for requests that failed
-        self.unmatched_playwright_requests = defaultdict(list)
-        
+
+        # -------------------------------------------------------------------
+        # State-machine maps
+        # -------------------------------------------------------------------
+
+        # CDP-only pending: requestId -> PendingCDPRecord
+        # Populated by attach_cdp_request. Never enriched with Playwright data.
+        self.pending_cdp: Dict[str, PendingCDPRecord] = {}
+
+        # Playwright-only pending: pw_id -> PendingPWRecord
+        # Populated by handle_request. No CDP requestId assigned.
+        self.pending_pw: Dict[int, PendingPWRecord] = {}
+
+        # CDP timing fingerprint -> list of requestIds that produced that fingerprint.
+        # Populated by attach_cdp_response. Consumed at correlation time.
+        self.cdp_timing_fps: Dict[str, List[str]] = defaultdict(list)
+
+        # In-flight correlated transactions (CDP_CORRELATED state).
+        # Keyed by CDP requestId. Populated by handle_response after fingerprint match.
+        # Consumed by handle_request_finished.
+        self.active_transactions: Dict[str, TransactionState] = {}
+
+        # After handle_response correlates, record pw_id -> cdp_id so that
+        # handle_request_finished can retrieve the transaction without re-doing
+        # the fingerprint lookup.
+        self.pw_to_active: Dict[int, str] = {}
+
+        # Navigation correlation: CDP loaderId -> sequence number of document request
+        self.loader_to_seq: Dict[str, int] = {}
+
+        # WebSocket state (unchanged)
         self.active_websockets: Dict[str, WebSocketState] = {}
         self.unmatched_cdp_websockets: Dict[str, list] = defaultdict(list)
         self.unmatched_pw_websockets: Dict[str, list] = defaultdict(list)
-        
+
+        # -------------------------------------------------------------------
+        # Instrumentation counters (readable by tests)
+        # -------------------------------------------------------------------
+        self.counters: Dict[str, int] = {
+            # By construction, speculative_assignments stays 0.
+            "speculative_assignments": 0,
+            # Non-zero would mean a correlation was overwritten after assignment.
+            "correlation_corrections": 0,
+            # Non-zero would mean identity changed after enrichment was written.
+            "post_correlation_identity_changes": 0,
+            # Non-zero means Playwright data was attached before fingerprint proof.
+            "premature_enrichments": 0,
+            # Non-zero means _finalize_txn was called on an already-finalized txn.
+            "duplicate_finalizations": 0,
+            # Non-zero means request id vs response echo id mismatch detected.
+            "cross_wired": 0,
+            # Non-zero means multiple CDP requests produced an identical timing fingerprint.
+            "fingerprint_collisions": 0,
+        }
+
+    # -----------------------------------------------------------------------
+    # Lifecycle control
+    # -----------------------------------------------------------------------
+
     def get_next_seq(self):
         with self.lock:
             self.seq_counter += 1
             return self.seq_counter
 
-    def _evict_stale_unmatched(self):
-        """Remove unmatched entries older than _UNMATCHED_TTL_SEC. Call under self.lock."""
-        now = time.time()
-        cutoff = now - self._UNMATCHED_TTL_SEC
-        for key in list(self.unmatched_playwright_requests.keys()):
-            alive = [r for r in self.unmatched_playwright_requests[key]
-                     if self._unmatched_timestamps.get(id(r), now) >= cutoff]
-            evicted = len(self.unmatched_playwright_requests[key]) - len(alive)
-            if evicted:
-                logger.debug(f"Evicted {evicted} stale unmatched PW requests for {key}")
-                self._unmatched_timestamps = {k: v for k, v in self._unmatched_timestamps.items()
-                                              if any(id(r) == k for r in alive)}
-            self.unmatched_playwright_requests[key] = alive
-        for key in list(self.unmatched_cdp_requests.keys()):
-            alive = [r for r in self.unmatched_cdp_requests[key]
-                     if self._unmatched_timestamps.get(id(r), now) >= cutoff]
-            evicted = len(self.unmatched_cdp_requests[key]) - len(alive)
-            if evicted:
-                logger.debug(f"Evicted {evicted} stale unmatched CDP requests for {key}")
-            self.unmatched_cdp_requests[key] = alive
-            
     def start_recording(self):
         self.recording = True
-        
+
     def stop_recording(self):
         self.recording = False
-        logger.info(f"Stopping recording. Waiting for pending requests...")
-        
-        # Graceful shutdown: wait for active requests to finish (max 5 seconds)
+        logger.info("Stopping recording. Flushing pending records...")
+
+        # Give in-flight requests up to 5 s to complete
         start_wait = time.time()
         while time.time() - start_wait < 5.0:
             with self.lock:
-                if not self.active_transactions:
+                if not self.active_transactions and not self.pending_cdp and not self.pending_pw:
                     break
             time.sleep(0.1)
-            
+
         with self.lock:
-            # Finalize remaining HTTP transactions
+            # Flush in-flight CDP_CORRELATED transactions (requestfinished never arrived)
             for txn in list(self.active_transactions.values()):
-                txn.error = "INCOMPLETE (Recording stopped)"
-                txn.completed = True
-                txn.completion_time = datetime.now().isoformat()
+                if not txn.finalized:
+                    txn.error = "INCOMPLETE (Recording stopped before requestfinished)"
+                    txn.completed = True
+                    txn.completion_time = datetime.now().isoformat()
+                    txn.correlation_state = "FINALIZED"
+                    txn.finalized = True
+                    if self.storage:
+                        self.storage.finalize_transaction(txn)
+            self.active_transactions.clear()
+            self.pw_to_active.clear()
+
+            # Flush remaining CDP-only orphans (no Playwright counterpart / no timing proof)
+            for request_id, cdp_rec in list(self.pending_cdp.items()):
+                txn = TransactionState(
+                    id=request_id,
+                    sequence=cdp_rec.sequence,
+                    url=cdp_rec.url,
+                    method=cdp_rec.method,
+                    request_headers=cdp_rec.request_headers,
+                    request_time=cdp_rec.request_time,
+                    resource_type=cdp_rec.resource_type,
+                    page_id=cdp_rec.page_id,
+                    frame_url="",
+                    initiator=cdp_rec.initiator,
+                    error="INCOMPLETE (CDP-only: no Playwright event observed)",
+                    completed=True,
+                    completion_time=datetime.now().isoformat(),
+                    correlation_state="FINALIZED",
+                    finalized=True,
+                )
                 if self.storage:
                     self.storage.finalize_transaction(txn)
-            self.active_transactions.clear()
-            
+            self.pending_cdp.clear()
+
+            # Flush remaining Playwright-only orphans (no CDP fingerprint observed)
+            for pw_id, pw_rec in list(self.pending_pw.items()):
+                self.seq_counter += 1
+                txn = TransactionState(
+                    id=f"pw-{pw_id}",
+                    sequence=self.seq_counter,
+                    url=pw_rec.url,
+                    method=pw_rec.method,
+                    request_headers=pw_rec.request_headers,
+                    request_time=pw_rec.request_time,
+                    resource_type=pw_rec.resource_type,
+                    page_id="",
+                    frame_url=pw_rec.frame_url,
+                    post_data=pw_rec.post_data,
+                    post_data_file=pw_rec.post_data_file,
+                    request_cookies=pw_rec.request_cookies,
+                    error="INCOMPLETE (Playwright-only: no CDP fingerprint observed)",
+                    completed=True,
+                    completion_time=datetime.now().isoformat(),
+                    correlation_state="FINALIZED",
+                    finalized=True,
+                )
+                if self.storage:
+                    self.storage.finalize_transaction(txn)
+            self.pending_pw.clear()
+
+            # Clear timing fingerprints dictionary to prevent stale leaks
+            self.cdp_timing_fps.clear()
+
             # Finalize open websockets
             for ws_id, ws_state in list(self.active_websockets.items()):
                 if ws_state.status == "OPEN":
@@ -94,89 +279,586 @@ class NetworkRecorder:
 
         if self.storage:
             self.storage.finalize()
-        
+
         self.gui_queue.put({"type": "COMPLETED"})
 
-    def attach_cdp_request(self, url: str, method: str, request_id: str, initiator: dict, event: dict, page_id: str):
-        if not self.recording: return
-        key = (url, method)
-        
+    # -----------------------------------------------------------------------
+    # CDP event handlers
+    # -----------------------------------------------------------------------
+
+    def attach_cdp_request(self, url: str, method: str, request_id: str,
+                           initiator: dict, event: dict, page_id: str):
+        """
+        Called when CDP Network.requestWillBeSent fires.
+
+        Creates a PendingCDPRecord. Does NOT associate with any Playwright
+        Request. Does NOT perform FIFO queue lookup. Does NOT enrich with
+        post_data, cookies, or Playwright-side headers.
+        """
+        if not self.recording:
+            return
         with self.lock:
-            
-            # 1. Create the authoritative transaction state mapped to CDP requestId
             self.seq_counter += 1
             seq = self.seq_counter
             ts = datetime.now().isoformat()
-            
-            # Use CDP data as baseline
             req_data = event.get("request", {})
-            txn = TransactionState(
-                id=request_id, # Authoritative CDP Request ID
+            loader_id = event.get("loaderId")
+
+            record = PendingCDPRecord(
+                request_id=request_id,
                 sequence=seq,
                 url=url,
                 method=method,
                 request_headers=req_data.get("headers", {}),
-                request_time=ts,
+                initiator=initiator,
                 resource_type=event.get("type", "Fetch"),
                 page_id=page_id,
-                frame_url="",
-                initiator=initiator
+                request_time=ts,
+                loader_id=loader_id,
             )
-            
-            self.active_transactions[request_id] = txn
-            
-            # For fallback (failed requests without timing)
-            self.cdp_unmatched_requests[key].append(request_id)
-            
-            # Enrich from pending Playwright requests if available
-            if self.unmatched_playwright_requests[key]:
-                pw_req = self.unmatched_playwright_requests[key].pop(0)
-                self.pw_to_cdp[id(pw_req)] = request_id
-                self._enrich_transaction_from_playwright(txn, pw_req)
-            loader_id = event.get("loaderId")
+            self.pending_cdp[request_id] = record
+
+            # Navigation correlation bookkeeping (unchanged behaviour)
             if loader_id and event.get("type") == "Document":
                 self.loader_to_seq[loader_id] = seq
-            
-            self.gui_queue.put(GUIEvent(type="STARTED", transaction=txn))
 
-
+            # Emit a GUI STARTED event with partial CDP data so the UI shows activity.
+            # This transaction object is ephemeral — it is not persisted.
+            partial_txn = TransactionState(
+                id=request_id,
+                sequence=seq,
+                url=url,
+                method=method,
+                request_headers=record.request_headers,
+                request_time=ts,
+                resource_type=record.resource_type,
+                page_id=page_id,
+                frame_url="",
+                initiator=initiator,
+                correlation_state="PENDING_CDP",
+            )
+            self.gui_queue.put(GUIEvent(type="STARTED", transaction=partial_txn))
 
     def attach_cdp_response(self, event: dict):
-        if not self.recording: return
+        """
+        Called when CDP Network.responseReceived fires.
+
+        Extracts the server-side timing dictionary from the CDP response and
+        stores it keyed by its fingerprint so that handle_response can look
+        it up when the Playwright timing values arrive.
+        """
         request_id = event.get("requestId")
         resp = event.get("response", {})
         t = resp.get("timing")
-        if t:
-            fp = f"{t.get('dnsStart')}_{t.get('dnsEnd')}_{t.get('connectStart')}_{t.get('connectEnd')}_{t.get('sendStart')}_{t.get('receiveHeadersEnd')}"
+        if t and request_id:
+            fp = compute_cdp_timing_fingerprint(t)
+            if fp:
+                with self.lock:
+                    if fp in self.cdp_timing_fps and len(self.cdp_timing_fps[fp]) > 0:
+                        self.counters["fingerprint_collisions"] += 1
+                    self.cdp_timing_fps[fp].append(request_id)
+
+    # -----------------------------------------------------------------------
+    # Playwright event handlers
+    # -----------------------------------------------------------------------
+
+    def handle_request(self, request, page_id: str):
+        """
+        Called when Playwright fires the 'request' event.
+
+        Creates a PendingPWRecord. Does NOT assign a CDP requestId.
+        Does NOT perform FIFO queue lookup. Playwright data stays isolated
+        until the timing fingerprint proves which CDP requestId it belongs to.
+        """
+        if not self.recording:
+            return
+        pw_id = id(request)
+        ts = datetime.now().isoformat()
+
+        # Read post_data here, in the Playwright event callback thread,
+        # before entering the lock (I/O should not block under the lock).
+        post_data = None
+        post_data_file = None
+        if config.save_request_bodies:
+            try:
+                post_data = request.post_data
+                if not post_data:
+                    buf = request.post_data_buffer
+                    if buf:
+                        # Sequence is unknown until correlation; use 0 as placeholder.
+                        # The file will be referenced by post_data_file; sequence in
+                        # the filename is only cosmetic.
+                        post_data_file = self.storage.save_request_body(0, buf)
+            except Exception as e:
+                logger.error(f"Request body read error: {e}")
+
+        cookies = []
+        cookie_header = request.headers.get("cookie", "")
+        if cookie_header:
+            cookies = [
+                {
+                    "name": c.split("=", 1)[0].strip(),
+                    "value": c.split("=", 1)[1].strip() if "=" in c else "",
+                }
+                for c in cookie_header.split(";")
+            ]
+
+        with self.lock:
+            record = PendingPWRecord(
+                pw_id=pw_id,
+                url=request.url,
+                method=request.method,
+                request_headers=dict(request.headers),
+                resource_type=request.resource_type,
+                frame_url=request.frame.url if request.frame else "",
+                request_cookies=cookies,
+                post_data=post_data,
+                post_data_file=post_data_file,
+                request_time=ts,
+                request_obj=request,
+            )
+            self.pending_pw[pw_id] = record
+
+    def handle_response(self, response):
+        """
+        Called when Playwright fires the 'response' event.
+
+        Attempts timing fingerprint correlation. On exact match:
+          - Removes PendingCDPRecord and PendingPWRecord from their maps.
+          - Merges them into a TransactionState (CDP_CORRELATED).
+          - Stores the merged transaction in active_transactions.
+          - Records pw_to_active so handle_request_finished can retrieve it.
+
+        No Playwright data is written to any CDP transaction before this point.
+        The merge is atomic under self.lock.
+
+        After releasing the lock, reads the response body (blocking I/O).
+        """
+        pw_id = id(response.request)
+        ts = datetime.now().isoformat()
+
+        txn: Optional[TransactionState] = None
+
+        with self.lock:
+            t = response.request.timing
+            if t:
+                fp = compute_pw_timing_fingerprint(t)
+                if fp and fp in self.cdp_timing_fps and self.cdp_timing_fps[fp]:
+                    cdp_id = self.cdp_timing_fps[fp].pop(0)
+                    if not self.cdp_timing_fps[fp]:
+                        del self.cdp_timing_fps[fp]
+
+                    cdp_rec = self.pending_cdp.pop(cdp_id, None)
+                    pw_rec = self.pending_pw.pop(pw_id, None)
+
+                    if cdp_rec:
+                        # Merge: Playwright headers supplement CDP headers
+                        merged_headers = dict(cdp_rec.request_headers)
+                        if pw_rec:
+                            merged_headers.update(pw_rec.request_headers)
+
+                        txn = TransactionState(
+                            id=cdp_rec.request_id,
+                            sequence=cdp_rec.sequence,
+                            url=cdp_rec.url,
+                            method=cdp_rec.method,
+                            request_headers=merged_headers,
+                            request_time=cdp_rec.request_time,
+                            resource_type=pw_rec.resource_type if pw_rec else cdp_rec.resource_type,
+                            page_id=cdp_rec.page_id,
+                            frame_url=pw_rec.frame_url if pw_rec else "",
+                            initiator=cdp_rec.initiator,
+                            post_data=pw_rec.post_data if pw_rec else None,
+                            post_data_file=pw_rec.post_data_file if pw_rec else None,
+                            request_cookies=pw_rec.request_cookies if pw_rec else [],
+                            response_time=ts,
+                            status=response.status,
+                            status_text=response.status_text,
+                            response_headers=dict(response.headers),
+                            content_type=response.headers.get("content-type", ""),
+                            correlation_state="CDP_CORRELATED",
+                        )
+                        self.active_transactions[cdp_id] = txn
+                        self.pw_to_active[pw_id] = cdp_id
+
+        if txn is None:
+            # Fingerprint did not match. This can happen legitimately when:
+            #   - Playwright's response event fires before CDP responseReceived
+            #     (the fingerprint will arrive later via attach_cdp_response and
+            #     will be consumed by handle_request_finished)
+            #   - The request has no timing (cached, main-document suppressed by PW)
+            # Stash the response metadata in pending_pw so handle_request_finished can use it.
             with self.lock:
-                if fp not in self.cdp_timing_fps:
-                    self.cdp_timing_fps[fp] = []
-                self.cdp_timing_fps[fp].append(request_id)
+                pw_rec = self.pending_pw.get(pw_id)
+                if pw_rec:
+                    pw_rec.response_status = response.status
+                    pw_rec.response_status_text = response.status_text
+                    pw_rec.response_headers = dict(response.headers)
+                    pw_rec.content_type = response.headers.get("content-type", "")
+            return
+
+        # Response body read — outside the lock to avoid blocking other callbacks
+        if config.save_response_bodies:
+            try:
+                body = response.body()
+                if body:
+                    ext = determine_extension(txn.url, txn.content_type, txn.resource_type)
+                    res_info = self.storage.save_resource(txn.sequence, body, ext)
+                    if res_info:
+                        with self.lock:
+                            if not txn.finalized:
+                                txn.resource = ResourceRecord(
+                                    file_path=res_info["file_path"],
+                                    size=res_info["size"],
+                                    sha256=res_info["sha256"],
+                                    mime_type=txn.content_type,
+                                    extension=ext,
+                                )
+            except Exception as e:
+                logger.debug(f"Response body unavailable for {txn.url}: {e}")
+
+        self.gui_queue.put(GUIEvent(type="UPDATED", transaction=txn))
+
+    def handle_request_finished(self, request):
+        """
+        Called when Playwright fires the 'requestfinished' event.
+
+        Deterministic 3-path resolution:
+        1. CDP_CORRELATED via handle_response: pw_to_active has an entry.
+           Retrieve and finalize the transaction.
+        2. Fingerprint present but handle_response didn't run first (e.g. CDP
+           responseReceived arrived between Playwright response and requestfinished):
+           correlate here via exact timing fingerprint.
+        3. No timing proof: PLAYWRIGHT_ONLY fallback. Build transaction from PendingPWRecord
+           without speculative CDP ID guessing.
+        """
+        pw_id = id(request)
+        ts = datetime.now().isoformat()
+
+        txn: Optional[TransactionState] = None
+
+        with self.lock:
+            # Path 1: already correlated by handle_response
+            cdp_id = self.pw_to_active.pop(pw_id, None)
+            if cdp_id:
+                txn = self.active_transactions.pop(cdp_id, None)
+
+            # Path 2: fingerprint present but handle_response didn't correlate yet
+            if txn is None:
+                t = getattr(request, "timing", None)
+                if t:
+                    fp = compute_pw_timing_fingerprint(t)
+                    if fp and fp in self.cdp_timing_fps and self.cdp_timing_fps[fp]:
+                        cdp_id = self.cdp_timing_fps[fp].pop(0)
+                        if not self.cdp_timing_fps[fp]:
+                            del self.cdp_timing_fps[fp]
+                        cdp_rec = self.pending_cdp.pop(cdp_id, None)
+                        pw_rec = self.pending_pw.pop(pw_id, None)
+
+                        if cdp_rec:
+                            merged_headers = dict(cdp_rec.request_headers)
+                            if pw_rec:
+                                merged_headers.update(pw_rec.request_headers)
+
+                            txn = TransactionState(
+                                id=cdp_rec.request_id,
+                                sequence=cdp_rec.sequence,
+                                url=cdp_rec.url,
+                                method=cdp_rec.method,
+                                request_headers=merged_headers,
+                                request_time=cdp_rec.request_time,
+                                resource_type=pw_rec.resource_type if pw_rec else cdp_rec.resource_type,
+                                page_id=cdp_rec.page_id,
+                                frame_url=pw_rec.frame_url if pw_rec else "",
+                                initiator=cdp_rec.initiator,
+                                post_data=pw_rec.post_data if pw_rec else None,
+                                post_data_file=pw_rec.post_data_file if pw_rec else None,
+                                request_cookies=pw_rec.request_cookies if pw_rec else [],
+                                correlation_state="CDP_CORRELATED",
+                            )
+                            if pw_rec and pw_rec.response_status is not None:
+                                txn.status = pw_rec.response_status
+                                txn.status_text = pw_rec.response_status_text
+                                txn.response_headers = pw_rec.response_headers or {}
+                                txn.content_type = pw_rec.content_type or ""
+                            else:
+                                try:
+                                    resp = request.response()
+                                    if resp:
+                                        txn.status = resp.status
+                                        txn.status_text = resp.status_text
+                                        txn.response_headers = dict(resp.headers)
+                                        txn.content_type = resp.headers.get("content-type", "")
+                                except Exception:
+                                    pass
+
+            # Path 3: Deterministic PLAYWRIGHT_ONLY fallback (no speculative CDP ID guessing)
+            if txn is None:
+                pw_rec = self.pending_pw.pop(pw_id, None)
+                self.seq_counter += 1
+                seq = self.seq_counter
+
+                if pw_rec:
+                    post_data = pw_rec.post_data
+                    post_data_file = pw_rec.post_data_file
+                    req_headers = pw_rec.request_headers
+                    req_cookies = pw_rec.request_cookies
+                    frame_url = pw_rec.frame_url
+                    resource_type = pw_rec.resource_type
+                    req_time = pw_rec.request_time
+                else:
+                    post_data = None
+                    post_data_file = None
+                    req_headers = dict(request.headers)
+                    req_cookies = []
+                    frame_url = request.frame.url if request.frame else ""
+                    resource_type = request.resource_type
+                    req_time = ts
+                    if config.save_request_bodies:
+                        try:
+                            post_data = request.post_data
+                        except Exception:
+                            pass
+
+                txn = TransactionState(
+                    id=f"pw-{pw_id}",
+                    sequence=seq,
+                    url=request.url,
+                    method=request.method,
+                    request_headers=req_headers,
+                    request_time=req_time,
+                    resource_type=resource_type,
+                    page_id="",
+                    frame_url=frame_url,
+                    post_data=post_data,
+                    post_data_file=post_data_file,
+                    request_cookies=req_cookies,
+                    correlation_state="PLAYWRIGHT_ONLY",
+                )
+
+                # Get response metadata for PLAYWRIGHT_ONLY
+                if pw_rec and pw_rec.response_status is not None:
+                    txn.status = pw_rec.response_status
+                    txn.status_text = pw_rec.response_status_text
+                    txn.response_headers = pw_rec.response_headers or {}
+                    txn.content_type = pw_rec.content_type or ""
+                else:
+                    try:
+                        resp = request.response()
+                        if resp:
+                            txn.status = resp.status
+                            txn.status_text = resp.status_text
+                            txn.response_headers = dict(resp.headers)
+                            txn.content_type = resp.headers.get("content-type", "")
+                    except Exception:
+                        pass
+
+        if txn is None:
+            return
+
+        txn.response_time = txn.response_time or ts
+        txn.completed = True
+        txn.completion_time = ts
+
+        # Read response body for PLAYWRIGHT_ONLY (not already done by handle_response)
+        if txn.correlation_state == "PLAYWRIGHT_ONLY" and config.save_response_bodies and txn.status:
+            try:
+                resp = request.response()
+                if resp:
+                    body = resp.body()
+                    if body:
+                        ext = determine_extension(txn.url, txn.content_type, txn.resource_type)
+                        res_info = self.storage.save_resource(txn.sequence, body, ext)
+                        if res_info:
+                            txn.resource = ResourceRecord(
+                                file_path=res_info["file_path"],
+                                size=res_info["size"],
+                                sha256=res_info["sha256"],
+                                mime_type=txn.content_type,
+                                extension=ext,
+                            )
+            except Exception:
+                pass
+
+        if (
+            not txn.error
+            and not txn.resource
+            and config.save_response_bodies
+            and txn.status not in (None, 204, 301, 302, 303, 304, 307, 308)
+        ):
+            txn.error = "Body unavailable"
+
+        self._finalize_txn(txn)
+
+    def handle_request_failed(self, request):
+        """
+        Called when Playwright fires the 'requestfailed' event.
+
+        Follows the same deterministic correlation paths as handle_request_finished,
+        but sets txn.error = request.failure and skips body reads.
+        """
+        pw_id = id(request)
+        ts = datetime.now().isoformat()
+
+        txn: Optional[TransactionState] = None
+
+        with self.lock:
+            # Path 1: already correlated
+            cdp_id = self.pw_to_active.pop(pw_id, None)
+            if cdp_id:
+                txn = self.active_transactions.pop(cdp_id, None)
+
+            # Path 2: fingerprint-based correlation (rare for failures, but possible)
+            if txn is None:
+                t = getattr(request, "timing", None)
+                if t:
+                    fp = compute_pw_timing_fingerprint(t)
+                    if fp and fp in self.cdp_timing_fps and self.cdp_timing_fps[fp]:
+                        cdp_id = self.cdp_timing_fps[fp].pop(0)
+                        if not self.cdp_timing_fps[fp]:
+                            del self.cdp_timing_fps[fp]
+                        cdp_rec = self.pending_cdp.pop(cdp_id, None)
+                        pw_rec = self.pending_pw.pop(pw_id, None)
+                        if cdp_rec:
+                            merged_headers = dict(cdp_rec.request_headers)
+                            if pw_rec:
+                                merged_headers.update(pw_rec.request_headers)
+                            txn = TransactionState(
+                                id=cdp_rec.request_id,
+                                sequence=cdp_rec.sequence,
+                                url=cdp_rec.url,
+                                method=cdp_rec.method,
+                                request_headers=merged_headers,
+                                request_time=cdp_rec.request_time,
+                                resource_type=pw_rec.resource_type if pw_rec else cdp_rec.resource_type,
+                                page_id=cdp_rec.page_id,
+                                frame_url=pw_rec.frame_url if pw_rec else "",
+                                initiator=cdp_rec.initiator,
+                                post_data=pw_rec.post_data if pw_rec else None,
+                                post_data_file=pw_rec.post_data_file if pw_rec else None,
+                                request_cookies=pw_rec.request_cookies if pw_rec else [],
+                                correlation_state="CDP_CORRELATED",
+                            )
+
+            # Path 3: Deterministic PLAYWRIGHT_ONLY fallback
+            if txn is None:
+                pw_rec = self.pending_pw.pop(pw_id, None)
+                self.seq_counter += 1
+                seq = self.seq_counter
+                if pw_rec:
+                    txn = TransactionState(
+                        id=f"pw-{pw_id}",
+                        sequence=seq,
+                        url=pw_rec.url,
+                        method=pw_rec.method,
+                        request_headers=pw_rec.request_headers,
+                        request_time=pw_rec.request_time,
+                        resource_type=pw_rec.resource_type,
+                        page_id="",
+                        frame_url=pw_rec.frame_url,
+                        post_data=pw_rec.post_data,
+                        post_data_file=pw_rec.post_data_file,
+                        request_cookies=pw_rec.request_cookies,
+                        correlation_state="PLAYWRIGHT_ONLY",
+                    )
+                else:
+                    txn = TransactionState(
+                        id=f"pw-{pw_id}",
+                        sequence=seq,
+                        url=request.url,
+                        method=request.method,
+                        request_headers=dict(request.headers),
+                        request_time=ts,
+                        resource_type=request.resource_type,
+                        page_id="",
+                        frame_url=request.frame.url if request.frame else "",
+                        correlation_state="PLAYWRIGHT_ONLY",
+                    )
+
+        if txn is None:
+            return
+
+        txn.completed = True
+        txn.completion_time = ts
+        txn.error = request.failure
+
+        self._finalize_txn(txn)
+
+        # Navigation failure bookkeeping (unchanged from original)
+        if request.is_navigation_request():
+            from models import NavigationRecord
+            frame_id = (
+                "main"
+                if request.frame == request.frame.page.main_frame
+                else (request.frame.name or f"frame-{id(request.frame)}")
+            )
+            nav_id = f"nav_fail_{txn.sequence:06d}"
+            nav_record = NavigationRecord(
+                navigation_id=nav_id,
+                page_id=txn.page_id,
+                frame_id=frame_id,
+                timestamp=ts,
+                from_url=None,
+                to_url=request.url,
+                type="document_navigation",
+                reason="Navigation",
+                status=None,
+                success=False,
+                document_request_sequence=txn.sequence,
+                dom_snapshot_id=None,
+                error=request.failure,
+            )
+            self.storage.save_navigation_record(nav_record)
+
+    # -----------------------------------------------------------------------
+    # Finalization (idempotent)
+    # -----------------------------------------------------------------------
+
+    def _finalize_txn(self, txn: TransactionState):
+        """
+        Write txn to manifest exactly once.
+        If called on an already-finalized transaction, increments the
+        duplicate_finalizations counter and returns without writing.
+        """
+        with self.lock:
+            if txn.finalized:
+                self.counters["duplicate_finalizations"] += 1
+                return
+            txn.finalized = True
+            txn.correlation_state = "FINALIZED"
+
+        self.storage.finalize_transaction(txn)
+        self.gui_queue.put(GUIEvent(type="COMPLETED", transaction=txn))
+
+    # -----------------------------------------------------------------------
+    # WebSocket event handlers (unchanged from original)
+    # -----------------------------------------------------------------------
 
     def attach_cdp_websocket(self, url: str, request_id: str, page_id: str, event: dict):
-        if not self.recording: return
-        
+        if not self.recording:
+            return
         with self.lock:
             ts = datetime.now().isoformat()
-            
             ws_state = WebSocketState(
-                id=request_id,
-                page_id=page_id,
-                url=url,
-                created_time=ts
+                id=request_id, page_id=page_id, url=url, created_time=ts
             )
             self.active_websockets[request_id] = ws_state
-            
             if self.storage:
                 self.storage.write_websocket_state(ws_state)
-            
             self.unmatched_cdp_websockets[url].append(request_id)
 
-    def attach_cdp_websocket_handshake(self, request_id: str, is_request: bool, headers: dict, status: int = None, status_text: str = None):
+    def attach_cdp_websocket_handshake(
+        self,
+        request_id: str,
+        is_request: bool,
+        headers: dict,
+        status: int = None,
+        status_text: str = None,
+    ):
         with self.lock:
             ws_state = self.active_websockets.get(request_id)
-            if not ws_state: return
-            
+            if not ws_state:
+                return
             if is_request:
                 ws_state.handshake_request_headers = headers
             else:
@@ -184,61 +866,65 @@ class NetworkRecorder:
                 if status is not None:
                     ws_state.handshake_status = status
                     ws_state.handshake_status_text = status_text
-                    
             if self.storage:
                 self.storage.write_websocket_state(ws_state)
 
-    def attach_cdp_websocket_close(self, request_id: str, ts_close: str, reason: str = None, code: int = None):
+    def attach_cdp_websocket_close(
+        self, request_id: str, ts_close: str, reason: str = None, code: int = None
+    ):
         with self.lock:
             ws_state = self.active_websockets.get(request_id)
-            if not ws_state: return
-            
+            if not ws_state:
+                return
             ws_state.closed_time = ts_close
-            if code: ws_state.close_code = code
-            if reason: ws_state.close_reason = reason
+            if code:
+                ws_state.close_code = code
+            if reason:
+                ws_state.close_reason = reason
             ws_state.status = "CLOSED"
-            
             if self.storage:
                 self.storage.write_websocket_state(ws_state)
-            
             del self.active_websockets[request_id]
 
     def attach_cdp_websocket_frame(self, request_id: str, direction: str, response: dict):
         with self.lock:
             ws_state = self.active_websockets.get(request_id)
-            if not ws_state: return
-            
+            if not ws_state:
+                return
             self.seq_counter += 1
             seq = self.seq_counter
-            
+
         ts = datetime.now().isoformat()
         opcode = response.get("opcode", 1)
         payload_data = response.get("payloadData", "")
-        
-        is_text = (opcode == 1)
+
+        is_text = opcode == 1
         payload_type = "text" if is_text else "binary"
-        
+
         import base64
+
         if is_text:
-            raw_bytes = payload_data.encode('utf-8')
+            raw_bytes = payload_data.encode("utf-8")
             payload_str = payload_data
         else:
             try:
                 raw_bytes = base64.b64decode(payload_data)
-            except:
-                raw_bytes = payload_data.encode('utf-8')
+            except Exception:
+                raw_bytes = payload_data.encode("utf-8")
             payload_str = None
-            
+
         payload_size = len(raw_bytes)
-        
+
         payload_file = None
         if config.save_response_bodies:
             if not is_text or payload_size >= 1000:
                 if self.storage:
-                    payload_file = self.storage.save_websocket_frame(request_id, seq, raw_bytes, is_text)
+                    payload_file = self.storage.save_websocket_frame(
+                        request_id, seq, raw_bytes, is_text
+                    )
                     if payload_file:
                         payload_str = None
-                        
+
         frame = WebSocketFrame(
             sequence=seq,
             websocket_id=request_id,
@@ -247,220 +933,16 @@ class NetworkRecorder:
             payload_type=payload_type,
             payload_size=payload_size,
             payload_file=payload_file,
-            payload=payload_str
+            payload=payload_str,
         )
-        
+
         with self.lock:
             ws_state = self.active_websockets.get(request_id)
-            if not ws_state: return
+            if not ws_state:
+                return
             ws_state.frames.append(frame)
             if self.storage:
                 self.storage.write_websocket_frame(ws_state, frame)
-                self.gui_queue.put({"type": "WS_UPDATED", "stats": len(self.active_websockets)})
-
-    def handle_request(self, request, page_id: str):
-        if not self.recording: return
-        key = (request.url, request.method)
-        pw_id = id(request)
-        
-        with self.lock:
-            # We just enrich if a CDP transaction is waiting.
-            # This FIFO is safe because identical requests at this stage are indistinguishable.
-            # The REAL correlation happens at handle_response/finished using timing.
-            if self.cdp_unmatched_requests[key]:
-                cdp_id = self.cdp_unmatched_requests[key].pop(0)
-                self.pw_to_cdp[pw_id] = cdp_id
-                txn = self.active_transactions.get(cdp_id)
-                if txn:
-                    self._enrich_transaction_from_playwright(txn, request)
-            else:
-                self.unmatched_playwright_requests[key].append(request)
-
-    def _enrich_transaction_from_playwright(self, txn: TransactionState, request):
-        # Override with rich Playwright data if available
-        txn.frame_url = request.frame.url if request.frame else ""
-        txn.resource_type = request.resource_type
-        
-        # Merge headers to ensure Playwright's generated headers are included
-        txn.request_headers.update(request.headers)
-        
-        if config.save_request_bodies:
-            try:
-                post_data = request.post_data
-                if post_data:
-                    txn.post_data = post_data
-                else:
-                    buffer = request.post_data_buffer
-                    if buffer:
-                        saved_path = self.storage.save_request_body(txn.sequence, buffer)
-                        txn.post_data_file = saved_path
-            except Exception as e:
-                logger.error(f"Req body error: {e}")
-
-        cookie_header = request.headers.get("cookie", "")
-        if cookie_header:
-            txn.request_cookies = [{"name": c.split('=', 1)[0].strip(), "value": c.split('=', 1)[1].strip() if '=' in c else ""} for c in cookie_header.split(';')]
-
-    def handle_response(self, response):
-        if not self.recording: return
-        pw_id = id(response.request)
-        ts = datetime.now().isoformat()
-        
-        t = response.request.timing
-        
-        with self.lock:
-            # DETERMINISTIC CORRELATION
-            cdp_id = self.pw_to_cdp.get(pw_id)
-            if t:
-                fp = f"{t.get('domainLookupStart')}_{t.get('domainLookupEnd')}_{t.get('connectStart')}_{t.get('connectEnd')}_{t.get('requestStart')}_{t.get('responseStart')}"
-                if fp in self.cdp_timing_fps and self.cdp_timing_fps[fp]:
-                    # Exact match overrides the initial FIFO guess!
-                    exact_cdp_id = self.cdp_timing_fps[fp].pop(0)
-                    cdp_id = exact_cdp_id
-                    self.pw_to_cdp[pw_id] = cdp_id
-            
-            if not cdp_id: return
-            txn = self.active_transactions.get(cdp_id)
-            if not txn: return
-            
-            # All mutations inside the lock to prevent concurrent thread corruption
-            txn.response_time = ts
-            txn.status = response.status
-            txn.status_text = response.status_text
-            txn.response_headers = response.headers
-            txn.content_type = response.headers.get("content-type", "")
-        
-        # Body read is blocking I/O — do outside the lock but after fields are safely set
-        if config.save_response_bodies:
-            try:
-                body = response.body()
-                if body:
-                    ext = determine_extension(txn.url, txn.content_type, txn.resource_type)
-                    res_info = self.storage.save_resource(txn.sequence, body, ext)
-                    if res_info:
-                        txn.resource = ResourceRecord(
-                            file_path=res_info["file_path"],
-                            size=res_info["size"],
-                            sha256=res_info["sha256"],
-                            mime_type=txn.content_type,
-                            extension=ext
-                        )
-            except Exception as e:
-                logger.debug(f"Response body unavailable for {txn.url}: {e}")
-                
-        self.gui_queue.put(GUIEvent(type="UPDATED", transaction=txn))
-
-    def handle_request_finished(self, request):
-        if not self.recording: return
-        pw_id = id(request)
-        ts = datetime.now().isoformat()
-        
-        with self.lock:
-            cdp_id = self.pw_to_cdp.pop(pw_id, None)
-            txn = self.active_transactions.pop(cdp_id, None) if cdp_id else None
-            
-            if not txn:
-                # Fallback for requests missed by CDP
-                key = (request.url, request.method)
-                if request in self.unmatched_playwright_requests[key]:
-                    self.unmatched_playwright_requests[key].remove(request)
-                
-                self.seq_counter += 1
-                seq = self.seq_counter
-                txn = TransactionState(
-                    id=f"pw-{pw_id}",
-                    sequence=seq,
-                    url=request.url,
-                    method=request.method,
-                    request_headers=request.headers,
-                    request_time=ts,
-                    resource_type=request.resource_type,
-                    page_id="",
-                    frame_url=request.frame.url if request.frame else ""
+                self.gui_queue.put(
+                    {"type": "WS_UPDATED", "stats": len(self.active_websockets)}
                 )
-
-                self._enrich_transaction_from_playwright(txn, request)
-                txn.response_time = ts
-                
-                # simulate response
-                try:
-                    resp = request.response()
-                    if resp:
-                        txn.status = resp.status
-                        txn.status_text = resp.status_text
-                        txn.response_headers = resp.headers
-                        txn.content_type = resp.headers.get("content-type", "")
-                        if config.save_response_bodies:
-                            body = resp.body()
-                            if body:
-                                ext = determine_extension(txn.url, txn.content_type, txn.resource_type)
-                                res_info = self.storage.save_resource(txn.sequence, body, ext)
-                                if res_info:
-                                    txn.resource = ResourceRecord(
-                                        file_path=res_info["file_path"], size=res_info["size"],
-                                        sha256=res_info["sha256"], mime_type=txn.content_type, extension=ext
-                                    )
-                except:
-                    pass
-
-        txn.completed = True
-        txn.completion_time = ts
-        if not txn.error and not txn.resource and config.save_response_bodies and txn.status not in (204, 301, 302, 303, 304, 307, 308):
-            txn.error = "Body unavailable"
-        self.storage.finalize_transaction(txn)
-        self.gui_queue.put(GUIEvent(type="COMPLETED", transaction=txn))
-
-            
-    def handle_request_failed(self, request):
-        if not self.recording: return
-        pw_id = id(request)
-        ts = datetime.now().isoformat()
-        
-        with self.lock:
-            cdp_id = self.pw_to_cdp.pop(pw_id, None)
-            txn = self.active_transactions.pop(cdp_id, None) if cdp_id else None
-            
-            if not txn:
-                key = (request.url, request.method)
-                if request in self.unmatched_playwright_requests[key]:
-                    self.unmatched_playwright_requests[key].remove(request)
-                self.seq_counter += 1
-                txn = TransactionState(
-                    id=f"pw-{pw_id}", sequence=self.seq_counter,
-                    url=request.url, method=request.method,
-                    request_headers=request.headers, request_time=ts,
-                    resource_type=request.resource_type, page_id="",
-                    frame_url=request.frame.url if request.frame else ""
-                )
-
-                self._enrich_transaction_from_playwright(txn, request)
-                
-        txn.completed = True
-        txn.completion_time = ts
-        txn.error = request.failure
-        self.storage.finalize_transaction(txn)
-        self.gui_queue.put(GUIEvent(type="FAILED", transaction=txn))
-        
-        if request.is_navigation_request():
-            # Create a failed navigation record
-            from models import NavigationRecord
-            frame_id = "main" if request.frame == request.frame.page.main_frame else (request.frame.name or f"frame-{id(request.frame)}")
-            nav_id = f"nav_fail_{self.seq_counter:06d}"
-            
-            nav_record = NavigationRecord(
-                navigation_id=nav_id,
-                page_id=txn.page_id,
-                frame_id=frame_id,
-                timestamp=ts,
-                from_url=None, # Cannot easily get from here, but this is a failure
-                to_url=request.url,
-                type="document_navigation",
-                reason="Navigation",
-                status=None,
-                success=False,
-                document_request_sequence=txn.sequence,
-                dom_snapshot_id=None,
-                error=request.failure
-            )
-            self.storage.save_navigation_record(nav_record)
-
