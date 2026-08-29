@@ -101,8 +101,8 @@ class StorageManager:
             logger.error(f"Failed to save resource {filename}: {e}")
             return None
 
-    def save_request_body(self, seq: int, body: bytes) -> str:
-        filename = f"{seq:06d}_request.bin"
+    def save_request_body(self, req_id: str, body: bytes) -> str:
+        filename = f"{req_id}_request.bin"
         filepath = os.path.join(self.request_bodies_dir, filename)
         try:
             with open(filepath, "wb") as f:

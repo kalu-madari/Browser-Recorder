@@ -34,6 +34,7 @@ class PendingCDPRecord:
     page_id: str
     frame_id: str
     request_time: str
+    fp: Optional[str] = None
     loader_id: Optional[str] = None
 @dataclass
 class PendingPWRecord:
@@ -173,8 +174,6 @@ class NetworkRecorder:
 
         # WebSocket state (unchanged)
         self.active_websockets: Dict[str, WebSocketState] = {}
-        self.unmatched_cdp_websockets: Dict[str, list] = defaultdict(list)
-        self.unmatched_pw_websockets: Dict[str, list] = defaultdict(list)
 
         # -------------------------------------------------------------------
         # Instrumentation counters (readable by tests)
@@ -207,6 +206,29 @@ class NetworkRecorder:
 
     def start_recording(self):
         self.recording = True
+
+    
+    def handle_page_close(self, page_id: str):
+        with self.lock:
+            # Clean up pending CDP requests
+            for req_id, rec in list(self.pending_cdp.items()):
+                if rec.page_id == page_id:
+                    del self.pending_cdp[req_id]
+                    if rec.fp and rec.fp in self.cdp_timing_fps:
+                        if req_id in self.cdp_timing_fps[rec.fp]:
+                            self.cdp_timing_fps[rec.fp].remove(req_id)
+                        if not self.cdp_timing_fps[rec.fp]:
+                            del self.cdp_timing_fps[rec.fp]
+                    
+            # Clean up active websockets
+            for ws_id, ws_state in list(self.active_websockets.items()):
+                if ws_state.page_id == page_id:
+                    ws_state.status = "CLOSED"
+                    ws_state.closed_time = __import__('datetime').datetime.now().isoformat()
+                    ws_state.close_reason = "Page Closed"
+                    if self.storage:
+                        self.storage.write_websocket_state(ws_state)
+                    del self.active_websockets[ws_id]
 
     def stop_recording(self):
         self.recording = False
@@ -334,6 +356,7 @@ class NetworkRecorder:
                 resource_type=event.get("type", "Fetch"),
                 page_id=page_id,
                 frame_id=event.get('frameId', 'unknown'),
+                fp=None,
                 request_time=ts,
                 loader_id=loader_id,
             )
@@ -361,6 +384,10 @@ class NetworkRecorder:
             )
             self.gui_queue.put(GUIEvent(type="STARTED", transaction=partial_txn))
 
+    
+    def attach_cdp_loading_finished(self, request_id: str, error: str = None):
+        pass
+
     def attach_cdp_response(self, event: dict):
         """
         Called when CDP Network.responseReceived fires.
@@ -379,6 +406,8 @@ class NetworkRecorder:
                     if fp in self.cdp_timing_fps and len(self.cdp_timing_fps[fp]) > 0:
                         self.counters["fingerprint_collisions"] += 1
                     self.cdp_timing_fps[fp].append(request_id)
+                    if request_id in self.pending_cdp:
+                        self.pending_cdp[request_id].fp = fp
 
     # -----------------------------------------------------------------------
     # Playwright event handlers
@@ -394,7 +423,8 @@ class NetworkRecorder:
         """
         if not self.recording:
             return
-        pw_id = id(request)
+        impl = getattr(request, "_impl_obj", request)
+        pw_id = getattr(impl, "_guid", str(id(request)))
         ts = datetime.now().isoformat()
 
         # Read post_data here, in the Playwright event callback thread,
@@ -404,15 +434,16 @@ class NetworkRecorder:
         if config.save_request_bodies:
             try:
                 post_data = request.post_data
-                if not post_data:
+            except Exception:
+                pass
+                
+            if not post_data:
+                try:
                     buf = request.post_data_buffer
                     if buf:
-                        # Sequence is unknown until correlation; use 0 as placeholder.
-                        # The file will be referenced by post_data_file; sequence in
-                        # the filename is only cosmetic.
-                        post_data_file = self.storage.save_request_body(0, buf)
-            except Exception as e:
-                logger.error(f"Request body read error: {e}")
+                        post_data_file = self.storage.save_request_body(pw_id, buf)
+                except Exception as e:
+                    logger.error(f"Request body read error: {e}")
 
         cookies = []
         cookie_header = request.headers.get("cookie", "")
@@ -458,7 +489,8 @@ class NetworkRecorder:
 
         After releasing the lock, reads the response body (blocking I/O).
         """
-        pw_id = id(response.request)
+        impl = getattr(response.request, "_impl_obj", response.request)
+        pw_id = getattr(impl, "_guid", str(id(response.request)))
         ts = datetime.now().isoformat()
 
         txn: Optional[TransactionState] = None
@@ -557,7 +589,8 @@ class NetworkRecorder:
         3. No timing proof: PLAYWRIGHT_ONLY fallback. Build transaction from PendingPWRecord
            without speculative CDP ID guessing.
         """
-        pw_id = id(request)
+        impl = getattr(request, "_impl_obj", request)
+        pw_id = getattr(impl, "_guid", str(id(request)))
         ts = datetime.now().isoformat()
 
         txn: Optional[TransactionState] = None
@@ -726,7 +759,8 @@ class NetworkRecorder:
         Follows the same deterministic correlation paths as handle_request_finished,
         but sets txn.error = request.failure and skips body reads.
         """
-        pw_id = id(request)
+        impl = getattr(request, "_impl_obj", request)
+        pw_id = getattr(impl, "_guid", str(id(request)))
         ts = datetime.now().isoformat()
 
         txn: Optional[TransactionState] = None
@@ -897,7 +931,6 @@ class NetworkRecorder:
             self.active_websockets[request_id] = ws_state
             if self.storage:
                 self.storage.write_websocket_state(ws_state)
-            self.unmatched_cdp_websockets[url].append(request_id)
 
     def attach_cdp_websocket_handshake(
         self,

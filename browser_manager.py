@@ -291,6 +291,8 @@ class BrowserManager(threading.Thread):
                 import datetime
                 cdp.on("Network.requestWillBeSent", lambda event: self._on_cdp_request(event, page_id))
                 cdp.on("Network.responseReceived", lambda event: self.recorder.attach_cdp_response(event))
+                cdp.on("Network.loadingFinished", lambda event: self.recorder.attach_cdp_loading_finished(event.get("requestId")))
+                cdp.on("Network.loadingFailed", lambda event: self.recorder.attach_cdp_loading_finished(event.get("requestId"), event.get("errorText")))
                 cdp.on("Network.webSocketCreated", lambda event: self.recorder.attach_cdp_websocket(event.get("url"), event.get("requestId"), page_id, event))
                 cdp.on("Network.webSocketWillSendHandshakeRequest", lambda event: self.recorder.attach_cdp_websocket_handshake(event.get("requestId"), True, event.get("request", {}).get("headers", {})))
                 cdp.on("Network.webSocketHandshakeResponseReceived", lambda event: self.recorder.attach_cdp_websocket_handshake(event.get("requestId"), False, event.get("response", {}).get("headers", {}), event.get("response", {}).get("status"), event.get("response", {}).get("statusText")))
@@ -369,6 +371,7 @@ class BrowserManager(threading.Thread):
                 # Playwright automatically detaches CDP on page close, 
                 # we just need to clean up our reference.
                 del self.cdp_sessions[page_id]
+                self.recorder.handle_page_close(page_id)
             except Exception as e:
                 logger.error(f"Error cleaning up CDP session for {page_id}: {e}")
 
