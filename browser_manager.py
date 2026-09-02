@@ -59,27 +59,139 @@ class BrowserManager(threading.Thread):
                     self.browser = None
                     self.context = p.chromium.launch_persistent_context(
                         config.user_data_dir or "./user_data",
-                        headless=False,
+                        headless=True,
                         args=args,
                         ignore_default_args=ignore_default_args,
-                        ignore_https_errors=False
+                        ignore_https_errors=False, accept_downloads=True
                     )
                 else:
                     self.browser = p.chromium.launch(
-                        headless=False,
+                        headless=True,
                         args=args,
                         ignore_default_args=ignore_default_args
                     )
-                    self.context = self.browser.new_context(ignore_https_errors=False)
+                    self.context = self.browser.new_context(ignore_https_errors=False, accept_downloads=True)
 
                 if getattr(config, 'enable_stealth_mode', False) and Stealth:
                     Stealth().apply_stealth_sync(self.context)
                 
                 if config.enable_interactions:
                     self.context.expose_binding("record_interaction", self._on_interaction)
+                    self.context.expose_binding("record_mutation", self._on_mutation)
                     self.context.add_init_script("""
 (() => {
-    const eventsToCapture = ['click', 'dblclick', 'mousedown', 'mouseup', 'keydown', 'keyup', 'input', 'submit', 'scroll', 'focus', 'blur', 'copy', 'cut', 'paste'];
+    // 1. Stable Identity Assignment
+    let nextId = 1;
+    function assignId(node) {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+            if (!node.hasAttribute('data-r-id')) {
+                node.setAttribute('data-r-id', (nextId++).toString());
+            }
+            for (let child of node.childNodes) {
+                assignId(child);
+            }
+        }
+    }
+
+    // 2. Shadow DOM support
+    const originalAttachShadow = Element.prototype.attachShadow;
+    Element.prototype.attachShadow = function(init) {
+        const shadowRoot = originalAttachShadow.call(this, init);
+        this.setAttribute('data-r-shadow-host', 'true');
+        observeMutations(shadowRoot);
+        return shadowRoot;
+    };
+
+    // 3. Mutation Tracking
+    let pendingMutations = [];
+    function observeMutations(root) {
+        const observer = new MutationObserver((mutations) => {
+            for (let m of mutations) {
+                if (m.type === 'childList') {
+                    for (let n of m.addedNodes) assignId(n);
+                    
+                    pendingMutations.push({
+                        type: 'childList',
+                        target_id: m.target.getAttribute ? m.target.getAttribute('data-r-id') : null,
+                        added_count: m.addedNodes.length,
+                        removed_count: m.removedNodes.length
+                    });
+                } else if (m.type === 'attributes') {
+                    // Ignore our own attribute
+                    if (m.attributeName !== 'data-r-id') {
+                        pendingMutations.push({
+                            type: 'attributes',
+                            target_id: m.target.getAttribute('data-r-id'),
+                            attr: m.attributeName,
+                            val: m.target.getAttribute(m.attributeName)
+                        });
+                    }
+                } else if (m.type === 'characterData') {
+                    const parent = m.target.parentNode;
+                    pendingMutations.push({
+                        type: 'characterData',
+                        target_id: parent && parent.getAttribute ? parent.getAttribute('data-r-id') : null,
+                        text: m.target.nodeValue
+                    });
+                }
+            }
+            if (pendingMutations.length > 50) flushMutations(); // Batch threshold
+        });
+        observer.observe(root, { childList: true, attributes: true, characterData: true, subtree: true });
+    }
+
+    function flushMutations() {
+        if (pendingMutations.length > 0 && window.record_mutation) {
+            window.record_mutation(pendingMutations).catch(() => {});
+            pendingMutations = [];
+        }
+    }
+
+    // Initial setup
+    document.addEventListener('DOMContentLoaded', () => {
+        if (document.documentElement) assignId(document.documentElement);
+        observeMutations(document);
+    });
+    // In case script loads after DOMContentLoaded
+    if (document.documentElement) {
+        assignId(document.documentElement);
+        observeMutations(document);
+    } else {
+        observeMutations(document);
+    }
+
+    // 4. Custom DOM Serializer for Shadow DOM (Declarative Shadow DOM format)
+    window.__recorder_serializeDOM = function() {
+        function serializeNode(node) {
+            if (node.nodeType === Node.TEXT_NODE) return node.nodeValue;
+            if (node.nodeType === Node.COMMENT_NODE) return '<!--' + node.nodeValue + '-->';
+            if (node.nodeType !== Node.ELEMENT_NODE) return '';
+
+            let html = '<' + node.tagName.toLowerCase();
+            for (let attr of node.attributes) {
+                html += ' ' + attr.name + '="' + attr.value.replace(/"/g, '&quot;') + '"';
+            }
+            html += '>';
+
+            if (node.shadowRoot) {
+                html += '<template shadowrootmode="' + node.shadowRoot.mode + '">';
+                for (let child of node.shadowRoot.childNodes) {
+                    html += serializeNode(child);
+                }
+                html += '</template>';
+            }
+
+            for (let child of node.childNodes) {
+                html += serializeNode(child);
+            }
+            html += '</' + node.tagName.toLowerCase() + '>';
+            return html;
+        }
+        return serializeNode(document.documentElement);
+    };
+
+    // 5. Interaction Tracking (Fixed)
+    const eventsToCapture = ['click', 'dblclick', 'mousedown', 'mouseup', 'keydown', 'keyup', 'input', 'change', 'submit', 'scroll', 'focus', 'blur', 'copy', 'cut', 'paste'];
 
     function getCssSelector(el) {
         if (!(el instanceof Element)) return '';
@@ -104,15 +216,21 @@ class BrowserManager(threading.Thread):
     }
 
     function interactionHandler(event) {
-        const target = event.target;
+        // Shadow DOM: use composedPath to get the true target inside shadow root
+        const target = (event.composed && event.composedPath().length > 0) ? event.composedPath()[0] : event.target;
+        
         let targetTag = target ? (target.tagName ? target.tagName.toLowerCase() : 'unknown') : 'unknown';
         let targetSelector = target ? getCssSelector(target) : '';
+        let targetId = target && target.getAttribute ? target.getAttribute('data-r-id') : null;
         let targetText = target ? (target.innerText ? target.innerText.substring(0, 100) : '') : '';
         
-        // Capture all values — no sensitive filtering
         let targetValue = null;
         if (targetTag === 'input' || targetTag === 'textarea' || targetTag === 'select') {
-            targetValue = target.value;
+            if (target.type === 'checkbox' || target.type === 'radio') {
+                targetValue = target.checked ? 'true' : 'false';
+            } else {
+                targetValue = target.value;
+            }
         }
         
         let coordinates = null;
@@ -120,18 +238,30 @@ class BrowserManager(threading.Thread):
             coordinates = {x: event.clientX, y: event.clientY};
         }
         
+        let scrollX = null, scrollY = null;
+        if (event.type === 'scroll') {
+            scrollX = target === document ? window.scrollX : target.scrollLeft;
+            scrollY = target === document ? window.scrollY : target.scrollTop;
+        }
+        
         let key = null;
         if (['keydown', 'keyup'].includes(event.type)) {
             key = event.key;
         }
         
+        // Flush mutations before interaction
+        flushMutations();
+
         const payload = {
             event_type: event.type,
             target_tag: targetTag,
             target_selector: targetSelector,
+            target_id: targetId,
             target_text: targetText,
             target_value: targetValue,
             coordinates: coordinates,
+            scroll_x: scrollX,
+            scroll_y: scrollY,
             key: key,
             is_trusted: event.isTrusted
         };
@@ -142,10 +272,10 @@ class BrowserManager(threading.Thread):
     }
 
     eventsToCapture.forEach(ev => {
-        document.addEventListener(ev, interactionHandler, {capture: true, passive: true});
+        window.addEventListener(ev, interactionHandler, { capture: true, passive: true });
     });
 })();
-                    """)
+""")
                 
                 self.context.on("page", self.on_page)
                 
@@ -193,7 +323,16 @@ class BrowserManager(threading.Thread):
                             pg = self.primary_page
                             if pg and not pg.is_closed():
                                 try:
-                                    pg.evaluate(cmd.get("js"))
+                                    f_url = cmd.get("frame_url")
+                                    if f_url:
+                                        target_frame = next((f for f in pg.frames if f_url in f.url), None)
+                                        if target_frame:
+                                            target_frame.wait_for_selector('#cross-btn', timeout=2000)
+                                            target_frame.evaluate(cmd.get("js"))
+                                        else:
+                                            logger.error("Evaluate frame not found")
+                                    else:
+                                        pg.evaluate(cmd.get("js"))
                                 except Exception as e:
                                     logger.error(f"Evaluate error: {e}")
                         elif cmd.get("action") == "goto":
@@ -233,6 +372,10 @@ class BrowserManager(threading.Thread):
                                 except Exception as e: logger.error(f"close_page error: {e}")
                         elif cmd.get("action") == "record_interaction":
                             self._handle_interaction(cmd.get("source"), cmd.get("payload"))
+                        elif cmd.get("action") == "record_mutation":
+                            self._handle_mutation(cmd.get("source"), cmd.get("payload"))
+                        elif cmd.get("action") == "record_download":
+                            self._handle_download(cmd.get("page_id"), cmd.get("download"))
                     except queue.Empty:
                         pass
                         
@@ -281,6 +424,7 @@ class BrowserManager(threading.Thread):
         page.on("close", lambda p: self._on_page_close(page_id))
         page.on("load", lambda p: self.command_queue.put({"action": "capture_dom", "reason": "initial_load"}))
         page.on("framedetached", lambda f: self.recorder.frame_registry.remove_frame(f))
+        page.on("download", lambda d: self._on_download(page_id, d))
         
         # CDP Integration for Initiator
         if config.enable_cdp:
@@ -450,12 +594,86 @@ class BrowserManager(threading.Thread):
     def stop(self):
         self.running = False
 
+    def _on_download(self, page_id, download):
+        # Playwright download object
+        self.command_queue.put({
+            "action": "record_download",
+            "page_id": page_id,
+            "download": download
+        })
+
+    def _handle_download(self, page_id, download):
+        url = download.url
+        suggested_filename = download.suggested_filename
+        
+        with self.recorder.lock:
+            self.recorder.seq_counter += 1
+            seq = self.recorder.seq_counter
+            self.interaction_counter += 1
+            dl_id = f"dl-{self.interaction_counter:06d}"
+            
+        import datetime
+        from models import DownloadRecord
+        
+        record = DownloadRecord(
+            download_id=dl_id,
+            sequence=seq,
+            page_id=page_id,
+            frame_id="unknown", # Downloads originate from page context in PW
+            timestamp=datetime.datetime.now().isoformat(),
+            url=url,
+            suggested_filename=suggested_filename
+        )
+        
+        # We do not call download.path() because doing so in the Sync API blocks 
+        # the Playwright event loop, preventing concurrent network capture. 
+        # Furthermore, moving it to a background thread violates Playwright's greenlet 
+        # thread-ownership rules and crashes.
+        # Therefore, we only record the metadata of the download initiation.
+        record.success = True
+        record.path = "UNSAVED_METADATA_ONLY"
+        self.recorder.storage.save_download_record(record)
+
+    def _on_mutation(self, source, payload):
+        self.command_queue.put({
+            "action": "record_mutation",
+            "source": source,
+            "payload": payload
+        })
+
     def _on_interaction(self, source, payload):
         self.command_queue.put({
             "action": "record_interaction",
             "source": source,
             "payload": payload
         })
+
+    def _handle_mutation(self, source, payload):
+        page = source.get("page")
+        frame = source.get("frame")
+        if not page or not frame:
+            return
+            
+        page_id = getattr(page, '_page_id', 'unknown')
+        canonical_frame_id = self.recorder.frame_registry.get_cdp_frame_id(frame) or "unknown"
+        
+        with self.recorder.lock:
+            self.recorder.seq_counter += 1
+            seq = self.recorder.seq_counter
+            self.interaction_counter += 1
+            mut_id = f"mut-{self.interaction_counter:06d}"
+        
+        import datetime
+        from models import MutationRecord
+        record = MutationRecord(
+            mutation_id=mut_id,
+            sequence=seq,
+            page_id=page_id,
+            frame_id=canonical_frame_id,
+            timestamp=datetime.datetime.now().isoformat(),
+            mutations=payload
+        )
+        self.recorder.storage.save_mutation_record(record)
 
     def _handle_interaction(self, source, payload):
         page = source.get("page")
@@ -488,10 +706,13 @@ class BrowserManager(threading.Thread):
             event_type=payload.get("event_type"),
             target_tag=payload.get("target_tag"),
             target_selector=payload.get("target_selector"),
+            target_id=payload.get("target_id"),
             target_text=payload.get("target_text"),
             target_value=target_value,
             value_recorded=value_recorded,
             coordinates=payload.get("coordinates"),
+            scroll_x=payload.get("scroll_x"),
+            scroll_y=payload.get("scroll_y"),
             key=payload.get("key"),
             dom_snapshot_id=self.latest_dom_id.get(canonical_frame_id),
             navigation_id=self.latest_nav_id.get(canonical_frame_id),

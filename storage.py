@@ -195,6 +195,24 @@ class StorageManager:
                 return False
         return True
 
+    def save_mutation_record(self, record):
+        with self.lock:
+            try:
+                mutation_manifest_path = os.path.join(self.capture_dir, "mutations.jsonl")
+                with open(mutation_manifest_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record.to_dict()) + "\n")
+            except Exception as e:
+                logger.error(f"Failed to save mutation: {e}")
+
+    def save_download_record(self, record):
+        with self.lock:
+            try:
+                download_manifest_path = os.path.join(self.capture_dir, "downloads.jsonl")
+                with open(download_manifest_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record.to_dict()) + "\n")
+            except Exception as e:
+                logger.error(f"Failed to save download: {e}")
+
     def save_interaction_record(self, record):
         with self.lock:
             try:

@@ -133,14 +133,46 @@ class InteractionRecord:
     event_type: str
     target_tag: str
     target_selector: str
-    target_text: Optional[str]
-    target_value: Optional[str]
-    value_recorded: bool
-    coordinates: Optional[Dict[str, int]]
-    key: Optional[str]
-    dom_snapshot_id: Optional[str]
-    navigation_id: Optional[str]
-    is_trusted: bool
+    target_id: Optional[str] = None
+    target_text: Optional[str] = None
+    target_value: Optional[str] = None
+    value_recorded: bool = False
+    coordinates: Optional[Dict[str, int]] = None
+    scroll_x: Optional[int] = None
+    scroll_y: Optional[int] = None
+    key: Optional[str] = None
+    dom_snapshot_id: Optional[str] = None
+    navigation_id: Optional[str] = None
+    is_trusted: bool = False
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class MutationRecord:
+    mutation_id: str
+    sequence: int
+    page_id: str
+    frame_id: str
+    timestamp: str
+    mutations: List[Dict[str, Any]]
+    
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+@dataclass
+class DownloadRecord:
+    download_id: str
+    sequence: int
+    page_id: str
+    frame_id: str
+    timestamp: str
+    url: str
+    suggested_filename: str
+    path: Optional[str] = None
+    error: Optional[str] = None
+    success: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
