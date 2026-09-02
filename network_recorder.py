@@ -114,6 +114,7 @@ class FrameRegistry:
         import threading
         self.lock = threading.RLock()
         self._mapping = {} # guid -> cdp_frame_id
+        self._page_frames = {} # page_id -> set of guids
 
     def _get_key(self, pw_frame) -> str:
         impl = getattr(pw_frame, '_impl_obj', pw_frame)
@@ -125,8 +126,29 @@ class FrameRegistry:
         if not pw_frame or not cdp_frame_id:
             return
         key = self._get_key(pw_frame)
+        page = getattr(pw_frame, 'page', None)
+        page_id = getattr(page, '_page_id', None) if page else None
+        
         with self.lock:
             self._mapping[key] = cdp_frame_id
+            if page_id:
+                if page_id not in self._page_frames:
+                    self._page_frames[page_id] = set()
+                self._page_frames[page_id].add(key)
+                
+    def remove_frame(self, pw_frame):
+        if not pw_frame:
+            return
+        key = self._get_key(pw_frame)
+        with self.lock:
+            self._mapping.pop(key, None)
+
+    def handle_page_close(self, page_id: str):
+        with self.lock:
+            if page_id in self._page_frames:
+                for key in self._page_frames[page_id]:
+                    self._mapping.pop(key, None)
+                del self._page_frames[page_id]
 
     def get_cdp_frame_id(self, pw_frame):
         if not pw_frame:
@@ -229,6 +251,7 @@ class NetworkRecorder:
                     if self.storage:
                         self.storage.write_websocket_state(ws_state)
                     del self.active_websockets[ws_id]
+            self.frame_registry.handle_page_close(page_id)
 
     def stop_recording(self):
         self.recording = False
@@ -250,7 +273,7 @@ class NetworkRecorder:
                     txn.error = "INCOMPLETE (Recording stopped before requestfinished)"
                     txn.completed = True
                     txn.completion_time = datetime.now().isoformat()
-                    txn.correlation_state = "FINALIZED"
+                    
                     txn.finalized = True
                     if self.storage:
                         self.storage.finalize_transaction(txn)
@@ -386,7 +409,33 @@ class NetworkRecorder:
 
     
     def attach_cdp_loading_finished(self, request_id: str, error: str = None):
-        pass
+        if error:
+            with self.lock:
+                cdp_rec = self.pending_cdp.pop(request_id, None)
+                if cdp_rec:
+                    import datetime
+                    from models import TransactionState
+                    txn = TransactionState(
+                        id=request_id,
+                        sequence=cdp_rec.sequence,
+                        url=cdp_rec.url,
+                        method=cdp_rec.method,
+                        request_headers=cdp_rec.request_headers,
+                        request_time=cdp_rec.request_time,
+                        resource_type=cdp_rec.resource_type,
+                        page_id=cdp_rec.page_id,
+                        frame_id=cdp_rec.frame_id,
+                        frame_url="",
+                        post_data=None,
+                        post_data_file=None,
+                        request_cookies=[],
+                        initiator=cdp_rec.initiator,
+                        error=error,
+                        correlation_state="CDP_ONLY_FAILED"
+                    )
+                    txn.completed = True
+                    txn.completion_time = datetime.datetime.now().isoformat()
+                    self._finalize_txn(txn)
 
     def attach_cdp_response(self, event: dict):
         """
@@ -835,7 +884,7 @@ class NetworkRecorder:
                         post_data=pw_rec.post_data,
                         post_data_file=pw_rec.post_data_file,
                         request_cookies=pw_rec.request_cookies,
-                        correlation_state="PLAYWRIGHT_ONLY",
+                        correlation_state="PLAYWRIGHT_ONLY_FAILED",
                     )
                 else:
                     txn = TransactionState(
@@ -858,7 +907,7 @@ class NetworkRecorder:
                         frame_id=self.frame_registry.get_cdp_frame_id(request.frame) if getattr(request, "frame", None) else "unknown",
 
                         frame_url=request.frame.url if request.frame else "",
-                        correlation_state="PLAYWRIGHT_ONLY",
+                        correlation_state="PLAYWRIGHT_ONLY_FAILED",
                     )
 
         if txn is None:
@@ -866,6 +915,11 @@ class NetworkRecorder:
 
         txn.completed = True
         txn.completion_time = ts
+        if txn.correlation_state in ("CDP_CORRELATED", "FINALIZED", None):
+            txn.correlation_state = "FAILED_CORRELATED"
+        elif txn.correlation_state == "PLAYWRIGHT_ONLY":
+            txn.correlation_state = "PLAYWRIGHT_ONLY_FAILED"
+            
         txn.error = request.failure
 
         self._finalize_txn(txn)
@@ -911,7 +965,7 @@ class NetworkRecorder:
                 self.counters["duplicate_finalizations"] += 1
                 return
             txn.finalized = True
-            txn.correlation_state = "FINALIZED"
+            
 
         self.storage.finalize_transaction(txn)
         self.gui_queue.put(GUIEvent(type="COMPLETED", transaction=txn))

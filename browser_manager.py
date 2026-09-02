@@ -280,6 +280,7 @@ class BrowserManager(threading.Thread):
         page.on("requestfailed", lambda r: self.recorder.handle_request_failed(r))
         page.on("close", lambda p: self._on_page_close(page_id))
         page.on("load", lambda p: self.command_queue.put({"action": "capture_dom", "reason": "initial_load"}))
+        page.on("framedetached", lambda f: self.recorder.frame_registry.remove_frame(f))
         
         # CDP Integration for Initiator
         if config.enable_cdp:
