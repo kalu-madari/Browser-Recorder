@@ -144,6 +144,11 @@ class InteractionRecord:
     dom_snapshot_id: Optional[str] = None
     navigation_id: Optional[str] = None
     is_trusted: bool = False
+    # Ordered list of data-r-id values for <iframe> elements from the top-level
+    # document down to the frame containing this interaction. Empty list means
+    # the interaction is in the top-level frame. Used to locate cross-origin
+    # (OOPIF) frames during replay without relying on CDP frame_id.
+    frame_target_chain: List[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)

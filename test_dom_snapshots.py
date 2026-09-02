@@ -1,3 +1,4 @@
+import re
 import os
 import sys
 import time
@@ -183,17 +184,17 @@ class TestDOMSnapshots(unittest.TestCase):
         self.assertIsNotNone(initial)
         with open(os.path.join(storage.capture_dir, initial['html_path']), 'r', encoding='utf-8') as f:
             content = f.read()
-            self.assertIn('id="status">initial<', content)
+            self.assertTrue(re.search(r'id="status"[^>]*>initial<', content))
             
         manual = next((r for r in page_1_records if r['reason'] == 'manual'), None)
         self.assertIsNotNone(manual)
         with open(os.path.join(storage.capture_dir, manual['html_path']), 'r', encoding='utf-8') as f:
             content = f.read()
-            self.assertIn('id="status">updated<', content)
+            self.assertTrue(re.search(r'id="status"[^>]*>updated<', content))
             self.assertNotIn('remove me', content)
-            self.assertIn('id="added">added text<', content)
+            self.assertTrue(re.search(r'id="added"[^>]*>added text<', content))
             self.assertIn('data-val="new"', content)
-            self.assertIn('class="new-class"', content)
+            self.assertTrue(re.search(r'class="new-class"', content))
             self.assertIn('value="new input"', content)
             
         nav = [r for r in page_1_records if 'page_b' in r['url']]

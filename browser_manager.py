@@ -128,9 +128,16 @@ class BrowserManager(threading.Thread):
                     }
                 } else if (m.type === 'characterData') {
                     const parent = m.target.parentNode;
+                    // Compute ordinal of this text node among all parent childNodes.
+                    // This disambiguates multiple sibling text nodes sharing the same parent target_id.
+                    let child_index = null;
+                    if (parent) {
+                        child_index = Array.from(parent.childNodes).indexOf(m.target);
+                    }
                     pendingMutations.push({
                         type: 'characterData',
                         target_id: parent && parent.getAttribute ? parent.getAttribute('data-r-id') : null,
+                        child_index: child_index,
                         text: m.target.nodeValue
                     });
                 }
@@ -327,7 +334,6 @@ class BrowserManager(threading.Thread):
                                     if f_url:
                                         target_frame = next((f for f in pg.frames if f_url in f.url), None)
                                         if target_frame:
-                                            target_frame.wait_for_selector('#cross-btn', timeout=2000)
                                             target_frame.evaluate(cmd.get("js"))
                                         else:
                                             logger.error("Evaluate frame not found")
@@ -675,6 +681,42 @@ class BrowserManager(threading.Thread):
         )
         self.recorder.storage.save_mutation_record(record)
 
+    def _build_frame_target_chain(self, frame) -> list:
+        """Walk the Playwright frame hierarchy from root to `frame`, collecting
+        the data-r-id of each <iframe> element that contains a child frame.
+
+        Returns an ordered list of data-r-id strings representing the iframe
+        element chain from the top-level document to the given frame.
+        Empty list means the frame IS the top-level main frame.
+
+        Never uses CDP frame_id as the sole identity.
+        Never uses URL-only matching.
+        If the data-r-id cannot be resolved for any iframe element in the chain,
+        that entry is recorded as "UNKNOWN" rather than omitted, so replay can
+        detect the ambiguity explicitly and fail visibly.
+        """
+        if frame is None:
+            return []
+        chain = []
+        current = frame
+        try:
+            while True:
+                parent = current.parent_frame
+                if parent is None:
+                    # current is the top-level main frame; no iframe element above it
+                    break
+                try:
+                    iframe_el = current.frame_element()
+                    rid = iframe_el.get_attribute("data-r-id")
+                    chain.append(rid if rid else "UNKNOWN")
+                except Exception:
+                    chain.append("UNKNOWN")
+                current = parent
+        except Exception:
+            pass
+        chain.reverse()  # root-to-leaf order
+        return chain
+
     def _handle_interaction(self, source, payload):
         page = source.get("page")
         frame = source.get("frame")
@@ -696,7 +738,11 @@ class BrowserManager(threading.Thread):
         target_value = payload.get("target_value")
         # Always record value — no filtering
         value_recorded = target_value is not None
-                
+
+        # Build the iframe element chain for OOPIF-safe frame identity.
+        # This does NOT retain the frame object; it extracts data-r-id strings immediately.
+        frame_target_chain = self._build_frame_target_chain(frame)
+
         record = InteractionRecord(
             interaction_id=interaction_id,
             sequence=seq,
@@ -716,6 +762,7 @@ class BrowserManager(threading.Thread):
             key=payload.get("key"),
             dom_snapshot_id=self.latest_dom_id.get(canonical_frame_id),
             navigation_id=self.latest_nav_id.get(canonical_frame_id),
-            is_trusted=payload.get("is_trusted", False)
+            is_trusted=payload.get("is_trusted", False),
+            frame_target_chain=frame_target_chain
         )
         self.recorder.storage.save_interaction_record(record)
